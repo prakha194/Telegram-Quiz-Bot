@@ -133,7 +133,10 @@ async def update_score(user_id, chat_id, username, first_name, is_correct):
 
 async def get_global_stats(user_id):
     return await db_pool.fetchrow(
-        "SELECT COALESCE(SUM(correct_answers),0) as correct, COALESCE(SUM(wrong_answers),0) as wrong, COALESCE(SUM(total_attempts),0) as total FROM user_scores WHERE user_id = $1",
+        """SELECT COALESCE(SUM(correct_answers),0) as correct,
+                  COALESCE(SUM(wrong_answers),0) as wrong,
+                  COALESCE(SUM(total_attempts),0) as total
+           FROM user_scores WHERE user_id = $1""",
         user_id
     )
 
@@ -142,10 +145,13 @@ async def get_global_rank(user_id):
         "SELECT COALESCE(SUM(correct_answers),0) FROM user_scores WHERE user_id = $1",
         user_id
     )
-    return await db_pool.fetchval(
-        "SELECT COUNT(DISTINCT user_id) + 1 FROM user_scores WHERE (SELECT COALESCE(SUM(correct_answers),0) FROM user_scores sub WHERE sub.user_id = user_scores.user_id) > $1",
+    rank = await db_pool.fetchval(
+        """SELECT COUNT(DISTINCT user_id) + 1 FROM user_scores
+           WHERE (SELECT COALESCE(SUM(correct_answers),0) FROM user_scores sub
+                  WHERE sub.user_id = user_scores.user_id) > $1""",
         user_correct
-    ) or 1
+    )
+    return int(rank) if rank else 1
 
 async def get_top_members(chat_id, limit=5):
     return await db_pool.fetch("""
@@ -155,24 +161,25 @@ async def get_top_members(chat_id, limit=5):
         ORDER BY correct_answers DESC, acc DESC LIMIT $2
     """, chat_id, limit)
 
-async def get_global_group_ranks():
-    return await db_pool.fetch("""
-        SELECT g.chat_id, g.chat_title, COALESCE(SUM(us.correct_answers),0) as total_correct
+async def get_group_global_rank(chat_id):
+    rows = await db_pool.fetch("""
+        SELECT g.chat_id, COALESCE(SUM(us.correct_answers),0) as total_correct
         FROM groups g LEFT JOIN user_scores us ON g.chat_id = us.chat_id
-        WHERE g.is_active = TRUE GROUP BY g.chat_id, g.chat_title ORDER BY total_correct DESC
+        WHERE g.is_active = TRUE
+        GROUP BY g.chat_id
+        ORDER BY total_correct DESC
     """)
-
-async def last_quiz(chat_id):
-    return await db_pool.fetchrow(
-        "SELECT id, question, correct_answer, options FROM quiz_history WHERE chat_id = $1 ORDER BY asked_at DESC LIMIT 1",
-        chat_id
-    )
+    for i, row in enumerate(rows, 1):
+        if row['chat_id'] == chat_id:
+            return i
+    return None
 
 # -------------------- Gemini --------------------
 async def generate_quiz():
-    categories = ["Brainstorming", "News", "GK", "Riddle", "Science", "Tech", "World News", "Telegram", "History", "Geography", "Sports"]
+    categories = ["Brainstorming", "News", "GK", "Riddle", "Science", "Tech", "World News",
+                  "Telegram", "History", "Geography", "Sports"]
     cat = random.choice(categories)
-    seed = f"{int(time.time())}_{random.randint(1,999999)}"
+    seed = f"{int(time.time())}_{random.randint(1, 999999)}"
     prompt = f"""Generate a very short multiple choice quiz about {cat}. Seed {seed}.
 Format exactly:
 QUESTION: (max 15 words)
@@ -202,7 +209,7 @@ Make it fun and concise."""
         except Exception as e:
             logger.error(f"Gemini error: {e}")
         await asyncio.sleep(1)
-    raise Exception("Gemini failed")
+    raise Exception("Gemini failed after 3 attempts")
 
 # -------------------- Helpers --------------------
 async def delete_later(bot, chat_id, msg_id, delay=30):
@@ -212,11 +219,12 @@ async def delete_later(bot, chat_id, msg_id, delay=30):
     except:
         pass
 
-def get_medal(i):
-    if i == 1: return "🥇"
-    if i == 2: return "🥈"
-    if i == 3: return "🥉"
-    return f"{i}."
+def format_rank(rank):
+    """Medal for top 3, #N for everyone else."""
+    if rank == 1: return "🥇"
+    if rank == 2: return "🥈"
+    if rank == 3: return "🥉"
+    return f"#{rank}"
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz(chat_id, title, bot):
@@ -226,6 +234,7 @@ async def send_quiz(chat_id, title, bot):
         except:
             pass
         del active_polls[chat_id]
+
     quiz = await generate_quiz()
     sent = await bot.send_poll(
         chat_id=chat_id,
@@ -233,7 +242,7 @@ async def send_quiz(chat_id, title, bot):
         options=quiz['options'],
         type=Poll.QUIZ,
         correct_option_id=quiz['correct_index'],
-        is_anonymous=True,
+        is_anonymous=False,  # FIX: must be False so PollAnswerHandler fires
         explanation=f"Correct: {quiz['correct_letter']} - {quiz['options'][quiz['correct_index']]}",
         open_period=300
     )
@@ -245,36 +254,53 @@ async def send_quiz(chat_id, title, bot):
         'correct': quiz['correct_index']
     }
     asyncio.create_task(delete_later(bot, chat_id, sent.message_id, 310))
+    logger.info(f"Quiz sent to {chat_id}: {quiz['question']}")
 
 async def send_quizzes_to_all():
-    for g in await get_active_groups():
-        await send_quiz(g['chat_id'], g['chat_title'], application.bot)
+    logger.info("Scheduler: sending quizzes to all groups")
+    groups = await get_active_groups()
+    for g in groups:
+        try:
+            await send_quiz(g['chat_id'], g['chat_title'], application.bot)
+        except Exception as e:
+            logger.error(f"Failed to send quiz to {g['chat_id']}: {e}")
 
 # -------------------- Poll Answer --------------------
-async def handle_poll_answer(update, context):
+async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pa = update.poll_answer
     uid = pa.user.id
     pid = pa.poll_id
     opt = pa.option_ids
-    for cid, data in active_polls.items():
+
+    if not opt:
+        # User retracted their answer
+        return
+
+    for cid, data in list(active_polls.items()):
         if data['poll_id'] == pid:
             if await already_answered(cid, data['quiz_id'], uid):
                 return
             await mark_answered(cid, data['quiz_id'], uid)
             is_correct = (len(opt) == 1 and opt[0] == data['correct'])
-            await update_score(uid, cid, pa.user.username or pa.user.first_name, pa.user.first_name, is_correct)
+            await update_score(
+                uid, cid,
+                pa.user.username or pa.user.first_name,
+                pa.user.first_name,
+                is_correct
+            )
+            logger.info(f"User {uid} answered in {cid}: correct={is_correct}")
             break
 
 # -------------------- Command Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Start command from {update.effective_chat.id} type={update.effective_chat.type}")
+    logger.info(f"Start from {update.effective_chat.id} type={update.effective_chat.type}")
     if update.effective_chat.type == "private":
         kb = [
-            [InlineKeyboardButton("➕ Add me to a group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
-            [InlineKeyboardButton("📊 My Global Stats", callback_data="my_stats")]
+            [InlineKeyboardButton("Add me to a group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
+            [InlineKeyboardButton("My Global Stats", callback_data="my_stats")]
         ]
         await update.message.reply_text(
-            "Hey! I'm Albert. I send short quizzes in groups.\n\nClick below to add me or see your stats.",
+            "Hey! I'm Albert. I send short quizzes in groups.\n\nClick below to add me or check your stats.",
             reply_markup=InlineKeyboardMarkup(kb)
         )
     else:
@@ -289,14 +315,17 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     cid = update.effective_chat.id
     title = update.effective_chat.title or "This group"
-    participants = await db_pool.fetchval("SELECT COUNT(DISTINCT user_id) FROM user_scores WHERE chat_id=$1", cid) or 0
-    quizzes = await db_pool.fetchval("SELECT COUNT(*) FROM quiz_history WHERE chat_id=$1", cid) or 0
-    answers = await db_pool.fetchval("SELECT COALESCE(SUM(total_attempts),0) FROM user_scores WHERE chat_id=$1", cid) or 0
+    participants = await db_pool.fetchval(
+        "SELECT COUNT(DISTINCT user_id) FROM user_scores WHERE chat_id=$1", cid) or 0
+    quizzes = await db_pool.fetchval(
+        "SELECT COUNT(*) FROM quiz_history WHERE chat_id=$1", cid) or 0
+    answers = await db_pool.fetchval(
+        "SELECT COALESCE(SUM(total_attempts),0) FROM user_scores WHERE chat_id=$1", cid) or 0
     text = (
-        f"📊 {title} Stats\n"
-        f"👥 Participants: {participants}\n"
-        f"📝 Quizzes: {quizzes}\n"
-        f"🎯 Answers: {answers}"
+        f"{title} Stats\n"
+        f"Participants: {participants}\n"
+        f"Quizzes sent: {quizzes}\n"
+        f"Total answers: {answers}"
     )
     msg = await update.effective_message.reply_text(text)
     asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 30))
@@ -309,30 +338,22 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     title = update.effective_chat.title or "This group"
 
-    # Global group ranks
-    global_ranks = await get_global_group_ranks()
-    lines = ["🌍 Global Group Ranks"]
-    my_rank = None
-    for i, row in enumerate(global_ranks, 1):
-        gtitle = row['chat_title'] or f"Group {row['chat_id']}"
-        medal = get_medal(i)
-        lines.append(f"{medal} {gtitle}: {row['total_correct']} ✅")
-        if row['chat_id'] == cid:
-            my_rank = i
-    if my_rank:
-        lines.append(f"\n📌 {title} is #{my_rank} globally.")
+    # This group's global rank only
+    group_rank = await get_group_global_rank(cid)
+    lines = [f"Leaderboard - {title}"]
+    if group_rank:
+        lines.append(f"Group global rank: #{group_rank}")
+    lines.append("")
 
-    # Top 5 members in this group
+    # Top 5 members of this group only
     members = await get_top_members(cid, 5)
     if members:
-        lines.append("\n👥 Top 5 Members")
+        lines.append("Top Members")
         for i, m in enumerate(members, 1):
-            medal = get_medal(i)
             name = m['first_name'] or "Anonymous"
-            acc = float(m['acc']) if m['acc'] is not None else 0.0
-            lines.append(f"{medal} {name}: {m['correct_answers']}✅ / {m['wrong_answers']}❌ ({acc}%)")
+            lines.append(f"#{i} {name} - {m['correct_answers']} correct / {m['wrong_answers']} wrong")
     else:
-        lines.append("\n👥 No members have answered yet.")
+        lines.append("No answers yet. Answer a quiz to appear here!")
 
     out = "\n".join(lines)
     msg = await update.effective_message.reply_text(out)
@@ -344,27 +365,27 @@ async def my_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user = query.from_user
     stats = await get_global_stats(user.id)
-    if stats and stats['total'] and int(stats['total']) > 0:
+    if stats and int(stats['total']) > 0:
         correct = int(stats['correct'])
         wrong = int(stats['wrong'])
         total = int(stats['total'])
         acc = round(correct * 100.0 / total, 1)
         rank = await get_global_rank(user.id)
-        medal = get_medal(int(rank))
+        rank_display = format_rank(rank)
         text = (
-            f"📊 Your Global Stats\n\n"
-            f"👤 {user.first_name}\n"
-            f"✅ Correct: {correct}\n"
-            f"❌ Wrong: {wrong}\n"
-            f"📊 Attempts: {total}\n"
-            f"🎯 Accuracy: {acc}%\n"
-            f"🏆 Global Rank: {medal}"
+            f"Your Global Stats\n\n"
+            f"Name: {user.first_name}\n"
+            f"Correct: {correct}\n"
+            f"Wrong: {wrong}\n"
+            f"Attempts: {total}\n"
+            f"Accuracy: {acc}%\n"
+            f"Global Rank: {rank_display}"
         )
     else:
         text = (
-            f"📊 Your Global Stats\n\n"
-            f"👤 {user.first_name}\n"
-            f"No quizzes answered yet. Join a group where I am added and answer!"
+            f"Your Global Stats\n\n"
+            f"Name: {user.first_name}\n"
+            f"No quizzes answered yet. Join a group and answer a quiz!"
         )
     await context.bot.send_message(chat_id=user.id, text=text)
 
@@ -375,7 +396,7 @@ async def group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = update.effective_chat.title or "Group"
             await add_group(cid, title)
             msg = await update.message.reply_text(
-                "✅ I'm Albert! I'll send short quizzes every 5 minutes.\nUse /stats and /leaderboard."
+                "I'm Albert! I'll send short quizzes every 5 minutes.\nUse /stats and /leaderboard."
             )
             asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 30))
             await send_quiz(cid, title, context.bot)
@@ -391,7 +412,9 @@ async def group_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def webhook():
     data = request.get_json(force=True)
     update = Update.de_json(data, application.bot)
-    asyncio.run_coroutine_threadsafe(application.process_update(update), main_loop).result(timeout=30)
+    asyncio.run_coroutine_threadsafe(
+        application.process_update(update), main_loop
+    ).result(timeout=30)
     return jsonify({"ok": True})
 
 @app.route("/")

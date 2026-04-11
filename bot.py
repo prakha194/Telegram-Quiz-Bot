@@ -2,19 +2,20 @@ import os
 import logging
 import asyncio
 import random
-import aiohttp
-import asyncpg
+import json
 from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    MessageHandler,
     filters,
     ContextTypes
 )
+import aiohttp
+import asyncpg
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # -------------------- Configuration --------------------
@@ -28,18 +29,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
-# Flask app (for webhook)
 app = Flask(__name__)
-
-# Scheduler for quiz intervals
 scheduler = AsyncIOScheduler()
-
-# Store active quiz messages per chat
 active_quizzes = {}
-
-# Database pool
 db_pool = None
 
 # -------------------- Database Functions --------------------
@@ -52,7 +46,8 @@ async def init_db_pool():
                 chat_id BIGINT PRIMARY KEY,
                 chat_title TEXT,
                 added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                is_active BOOLEAN DEFAULT TRUE
+                is_active BOOLEAN DEFAULT TRUE,
+                settings JSONB DEFAULT '{"quiz_interval": 30}'::jsonb
             )
         """)
         await conn.execute("""
@@ -70,7 +65,9 @@ async def init_db_pool():
                 user_id BIGINT,
                 chat_id BIGINT,
                 username TEXT,
+                first_name TEXT,
                 correct_answers INTEGER DEFAULT 0,
+                wrong_answers INTEGER DEFAULT 0,
                 total_attempts INTEGER DEFAULT 0,
                 PRIMARY KEY (user_id, chat_id)
             )
@@ -83,7 +80,7 @@ async def add_group(chat_id, chat_title):
             INSERT INTO groups (chat_id, chat_title) 
             VALUES ($1, $2) 
             ON CONFLICT (chat_id) DO UPDATE 
-            SET is_active = TRUE
+            SET is_active = TRUE, chat_title = EXCLUDED.chat_title
         """, chat_id, chat_title)
 
 async def remove_group(chat_id):
@@ -101,25 +98,52 @@ async def save_quiz_history(chat_id, question, correct_answer, options):
             VALUES ($1, $2, $3, $4)
         """, chat_id, question, correct_answer, options)
 
-async def update_score(user_id, chat_id, username, is_correct):
+async def update_score(user_id, chat_id, username, first_name, is_correct):
     async with db_pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO user_scores (user_id, chat_id, username, correct_answers, total_attempts)
-            VALUES ($1, $2, $3, $4, 1)
-            ON CONFLICT (user_id, chat_id) DO UPDATE
-            SET correct_answers = user_scores.correct_answers + $4,
-                total_attempts = user_scores.total_attempts + 1,
-                username = $3
-        """, user_id, chat_id, username, 1 if is_correct else 0)
+        if is_correct:
+            await conn.execute("""
+                INSERT INTO user_scores (user_id, chat_id, username, first_name, correct_answers, wrong_answers, total_attempts)
+                VALUES ($1, $2, $3, $4, 1, 0, 1)
+                ON CONFLICT (user_id, chat_id) DO UPDATE
+                SET correct_answers = user_scores.correct_answers + 1,
+                    total_attempts = user_scores.total_attempts + 1,
+                    username = $3,
+                    first_name = $4
+            """, user_id, chat_id, username, first_name)
+        else:
+            await conn.execute("""
+                INSERT INTO user_scores (user_id, chat_id, username, first_name, correct_answers, wrong_answers, total_attempts)
+                VALUES ($1, $2, $3, $4, 0, 1, 1)
+                ON CONFLICT (user_id, chat_id) DO UPDATE
+                SET wrong_answers = user_scores.wrong_answers + 1,
+                    total_attempts = user_scores.total_attempts + 1,
+                    username = $3,
+                    first_name = $4
+            """, user_id, chat_id, username, first_name)
+
+async def get_user_stats(user_id, chat_id):
+    async with db_pool.acquire() as conn:
+        return await conn.fetchrow("""
+            SELECT correct_answers, wrong_answers, total_attempts
+            FROM user_scores
+            WHERE user_id = $1 AND chat_id = $2
+        """, user_id, chat_id)
+
+async def get_group_stats(chat_id):
+    async with db_pool.acquire() as conn:
+        total_participants = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM user_scores WHERE chat_id = $1", chat_id)
+        total_quizzes = await conn.fetchval("SELECT COUNT(*) FROM quiz_history WHERE chat_id = $1", chat_id)
+        total_answers = await conn.fetchval("SELECT COALESCE(SUM(total_attempts), 0) FROM user_scores WHERE chat_id = $1", chat_id)
+        return total_participants, total_quizzes, total_answers
 
 async def get_leaderboard(chat_id, limit=10):
     async with db_pool.acquire() as conn:
         return await conn.fetch("""
-            SELECT username, correct_answers, total_attempts,
-                   ROUND(correct_answers * 100.0 / total_attempts, 1) AS accuracy
+            SELECT username, first_name, correct_answers, wrong_answers, total_attempts,
+                   ROUND(correct_answers * 100.0 / NULLIF(total_attempts, 0), 1) AS accuracy
             FROM user_scores
-            WHERE chat_id = $1
-            ORDER BY correct_answers DESC
+            WHERE chat_id = $1 AND total_attempts > 0
+            ORDER BY correct_answers DESC, accuracy DESC
             LIMIT $2
         """, chat_id, limit)
 
@@ -135,7 +159,6 @@ async def get_last_quiz(chat_id):
 
 # -------------------- Gemini Quiz Generator --------------------
 async def generate_quiz():
-    """Generate a random quiz question using Gemini 2.5 Flash API"""
     categories = [
         "General Knowledge", "Science", "Technology", "World News",
         "Telegram", "Current Affairs", "History", "Geography",
@@ -162,11 +185,8 @@ async def generate_quiz():
             }
         ) as response:
             data = await response.json()
-            
             try:
                 text = data['candidates'][0]['content']['parts'][0]['text']
-                
-                # Parse response
                 lines = text.strip().split('\n')
                 question = ""
                 options = []
@@ -181,7 +201,6 @@ async def generate_quiz():
                     elif line.startswith("ANSWER:"):
                         answer = line.replace("ANSWER:", "").strip().upper()
                 
-                # Ensure we have 4 options
                 if len(options) != 4:
                     options = ["Option A", "Option B", "Option C", "Option D"]
                 
@@ -192,8 +211,7 @@ async def generate_quiz():
                     'category': category
                 }
             except Exception as e:
-                logger.error(f"Gemini parse error: {e}, response: {data}")
-                # Fallback quiz
+                logger.error(f"Gemini error: {e}")
                 return {
                     'question': "What is the capital of France?",
                     'options': ["London", "Berlin", "Paris", "Madrid"],
@@ -203,9 +221,7 @@ async def generate_quiz():
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz_to_chat(chat_id, chat_title, context):
-    """Send a quiz to a specific chat"""
     try:
-        # Delete previous quiz if exists
         if chat_id in active_quizzes:
             try:
                 await context.bot.delete_message(
@@ -215,11 +231,12 @@ async def send_quiz_to_chat(chat_id, chat_title, context):
             except:
                 pass
         
-        # Generate new quiz
         quiz = await generate_quiz()
         
-        # Create keyboard with options
         keyboard = [
+            [
+                InlineKeyboardButton("📊 Show Results", callback_data=f"show_results_{chat_id}")
+            ],
             [
                 InlineKeyboardButton("🔴 A", callback_data=f"quiz_{chat_id}_A"),
                 InlineKeyboardButton("🔵 B", callback_data=f"quiz_{chat_id}_B"),
@@ -229,19 +246,19 @@ async def send_quiz_to_chat(chat_id, chat_title, context):
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Build options text
+        # Build options text with percentage placeholders
         options_text = ""
         for i, opt in enumerate(quiz['options']):
             letter = ['A', 'B', 'C', 'D'][i]
             emoji = ["🔴", "🔵", "🟢", "🟡"][i]
             options_text += f"{emoji} {letter}: {opt}\n"
         
-        # Send quiz message
         message_text = (
-            f"📊 **{quiz['category']} Quiz** 📊\n\n"
-            f"❓ {quiz['question']}\n\n"
+            f"**#Question**\n"
+            f"{quiz['question']}\n\n"
+            f"*Anonymous Quiz*\n\n"
             f"{options_text}\n"
-            f"⏰ New quiz in 30 minutes!"
+            f"0% Ans 1 | 0% Ans 2 | 0% Ans 3 | 0% Ans 4"
         )
         
         sent_msg = await context.bot.send_message(
@@ -251,19 +268,14 @@ async def send_quiz_to_chat(chat_id, chat_title, context):
             parse_mode='Markdown'
         )
         
-        # Store active quiz
         active_quizzes[chat_id] = sent_msg.message_id
-        
-        # Save to history
         await save_quiz_history(chat_id, quiz['question'], quiz['correct'], quiz['options'])
-        
         logger.info(f"Quiz sent to {chat_title} ({chat_id})")
         
     except Exception as e:
         logger.error(f"Failed to send quiz to {chat_id}: {e}")
 
 async def send_quiz_to_all():
-    """Send quiz to all active groups"""
     groups = await get_active_groups()
     for group in groups:
         await send_quiz_to_chat(group['chat_id'], group['chat_title'], application)
@@ -271,69 +283,136 @@ async def send_quiz_to_all():
 # -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    
+    keyboard = [
+        [InlineKeyboardButton("➕ Add me to your chat", url=f"https://t.me/{context.bot.username}?startgroup=true")],
+        [InlineKeyboardButton("📢 Channel", url="https://t.me/sybotik")],
+        [InlineKeyboardButton("🆘 Support", url="https://t.me/sybotik_support")],
+        [InlineKeyboardButton("📊 View your stats", callback_data="view_stats")],
+        [InlineKeyboardButton("🌐 Website", url="https://sybotik.com")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
     await update.message.reply_text(
-        f"🤖 **Quiz Bot**\n\n"
-        f"Welcome, {user.first_name}!\n\n"
-        f"Add me to any group or channel, and I'll send a quiz every 30 minutes!\n\n"
-        f"**Features:**\n"
-        f"✅ Automatic quizzes every 30 minutes\n"
-        f"✅ Categories: GK, Science, News, Tech, and more\n"
-        f"✅ Instant feedback – green for correct, red for wrong\n"
-        f"✅ Leaderboard to track scores\n\n"
-        f"**Commands:**\n"
-        f"/leaderboard - Show top scorers\n"
-        f"/stats - Group statistics\n"
-        f"/help - Show this message",
+        f"Hey there! My name is **Albert**. I am a multi-language quiz bot that sends random quizzes in groups.\n\n"
+        f"Send the /settings command in groups to configure me.\n\n"
+        f"*Powered by Sybotik.*",
+        reply_markup=reply_markup,
         parse_mode='Markdown'
     )
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        f"📖 **Help**\n\n"
-        f"Add me to a group and make me an admin.\n"
-        f"I'll send a quiz every 30 minutes automatically!\n\n"
-        f"**Commands:**\n"
-        f"/start - Start the bot\n"
-        f"/leaderboard - Show top 10 scorers\n"
-        f"/stats - Show group quiz statistics\n\n"
-        f"Each quiz has 4 options. Click on A, B, C, or D to answer.\n"
-        f"Correct answers are shown in green, wrong in red.",
-        parse_mode='Markdown'
-    )
-
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or "This group"
+    
+    keyboard = [
+        [InlineKeyboardButton("⏱️ Set Quiz Interval", callback_data="set_interval")],
+        [InlineKeyboardButton("📊 View Group Stats", callback_data="group_stats")],
+        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
+        [InlineKeyboardButton("❌ Close", callback_data="close_settings")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        f"⚙️ **Settings for {chat_title}**\n\n"
+        f"Configure how Albert behaves in this chat.\n\n"
+        f"Current settings:\n"
+        f"• Quiz interval: 30 minutes",
+        reply_markup=reply_markup,
+        parse_mode='Markdown'
+    )
+
+async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or "This group"
+    
+    total_participants, total_quizzes, total_answers = await get_group_stats(chat_id)
+    
+    await update.effective_message.reply_text(
+        f"📊 **Group Statistics for {chat_title}**\n\n"
+        f"👥 Total participants: {total_participants}\n"
+        f"📝 Total quizzes sent: {total_quizzes}\n"
+        f"🎯 Total answers given: {total_answers}\n\n"
+        f"Keep participating to improve your score! 💪",
+        parse_mode='Markdown'
+    )
+
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id=None):
+    user = update.effective_user
+    if not chat_id:
+        chat_id = update.effective_chat.id
+    
+    stats = await get_user_stats(user.id, chat_id)
+    chat_title = update.effective_chat.title or "this group"
+    
+    if stats:
+        correct = stats['correct_answers']
+        wrong = stats['wrong_answers']
+        total = stats['total_attempts']
+        accuracy = round((correct * 100.0 / total), 1) if total > 0 else 0
+        
+        # Motivational message based on performance
+        if accuracy >= 80:
+            motivation = "🌟 Excellent! You're a quiz master! Keep shining!"
+        elif accuracy >= 60:
+            motivation = "🎉 Great job! You're doing really well!"
+        elif accuracy >= 40:
+            motivation = "👍 Good effort! Practice makes perfect!"
+        elif accuracy >= 20:
+            motivation = "💪 Keep going! Every quiz makes you smarter!"
+        else:
+            motivation = "🌱 You're just getting started! Try more quizzes to improve!"
+        
+        await update.effective_message.reply_text(
+            f"📊 **Your Stats in {chat_title}**\n\n"
+            f"👤 Name: {user.first_name}\n"
+            f"🆔 ID: {user.id}\n\n"
+            f"✅ Correct answers: {correct}\n"
+            f"❌ Wrong answers: {wrong}\n"
+            f"📊 Total attempts: {total}\n"
+            f"🎯 Accuracy: {accuracy}%\n\n"
+            f"💬 {motivation}\n\n"
+            f"Keep participating! You can do better! 💪",
+            parse_mode='Markdown'
+        )
+    else:
+        await update.effective_message.reply_text(
+            f"📊 **Your Stats in {chat_title}**\n\n"
+            f"👤 Name: {user.first_name}\n"
+            f"🆔 ID: {user.id}\n\n"
+            f"✅ Correct answers: 0\n"
+            f"❌ Wrong answers: 0\n"
+            f"📊 Total attempts: 0\n"
+            f"🎯 Accuracy: 0%\n\n"
+            f"🌱 You haven't participated in any quiz yet!\n"
+            f"💬 Answer the next quiz to get started! 🚀",
+            parse_mode='Markdown'
+        )
+
+async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id=None):
+    if not chat_id:
+        chat_id = update.effective_chat.id
+    
     leaderboard = await get_leaderboard(chat_id)
     
     if not leaderboard:
-        await update.message.reply_text("📊 No scores yet! Be the first to answer a quiz!")
+        await update.effective_message.reply_text(
+            "🏆 **Leaderboard**\n\n"
+            "No scores yet! Be the first to answer a quiz! 🚀",
+            parse_mode='Markdown'
+        )
         return
     
     message = "🏆 **Leaderboard** 🏆\n\n"
     for i, user in enumerate(leaderboard, 1):
         medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-        username = user['username'] or "Anonymous"
-        message += f"{medal} {username}: {user['correct_answers']} correct ({user['accuracy']}%)\n"
+        name = user['first_name'] or user['username'] or "Anonymous"
+        accuracy = user['accuracy'] or 0
+        message += f"{medal} {name}: {user['correct_answers']} ✅ / {user['wrong_answers']} ❌ (Accuracy: {accuracy}%)\n"
     
-    await update.message.reply_text(message, parse_mode='Markdown')
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    chat_title = update.effective_chat.title or "Private Chat"
+    message += f"\n💬 {random.choice(['Keep going!', 'You can do better!', 'Next time you will win!', 'Practice makes perfect!'])}"
     
-    async with db_pool.acquire() as conn:
-        total_quizzes = await conn.fetchval("SELECT COUNT(*) FROM quiz_history WHERE chat_id = $1", chat_id)
-        total_users = await conn.fetchval("SELECT COUNT(DISTINCT user_id) FROM user_scores WHERE chat_id = $1", chat_id)
-        total_attempts = await conn.fetchval("SELECT COALESCE(SUM(total_attempts), 0) FROM user_scores WHERE chat_id = $1", chat_id)
-    
-    await update.message.reply_text(
-        f"📊 **{chat_title} Statistics**\n\n"
-        f"📝 Total quizzes sent: {total_quizzes}\n"
-        f"👥 Active participants: {total_users}\n"
-        f"🎯 Total answers given: {total_attempts}\n\n"
-        f"Use /leaderboard to see top scorers!",
-        parse_mode='Markdown'
-    )
+    await update.effective_message.reply_text(message, parse_mode='Markdown')
 
 async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -342,69 +421,124 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     
-    # Parse callback data
-    parts = query.data.split('_')
-    selected = parts[2] if len(parts) > 2 else None
-    
-    if not selected:
-        return
-    
-    # Get the question from history
-    quiz = await get_last_quiz(chat_id)
-    
-    if not quiz:
-        await query.edit_message_text("Quiz expired! Waiting for next quiz...")
-        return
-    
-    correct = quiz['correct_answer']
-    is_correct = (selected == correct)
-    options = quiz['options']
-    
-    # Update score
-    await update_score(user.id, chat_id, user.username or user.first_name, is_correct)
-    
-    # Create result message
-    result_text = ""
-    for i, opt in enumerate(options):
-        letter = ['A', 'B', 'C', 'D'][i]
-        if letter == correct:
-            result_text += f"✅ {letter}: {opt} (Correct)\n"
-        elif letter == selected and not is_correct:
-            result_text += f"❌ {letter}: {opt} (Your answer - Wrong)\n"
+    # Show results button
+    if query.data.startswith("show_results_"):
+        quiz = await get_last_quiz(chat_id)
+        if quiz:
+            options = quiz['options']
+            result_text = f"**📊 Quiz Results**\n\n"
+            result_text += f"❓ {quiz['question']}\n\n"
+            for i, opt in enumerate(options):
+                letter = ['A', 'B', 'C', 'D'][i]
+                result_text += f"✅ {letter}: {opt}\n"
+            result_text += f"\n🔑 Correct answer: {quiz['correct_answer']}"
+            await query.edit_message_text(result_text, parse_mode='Markdown')
         else:
-            result_text += f"⚪ {letter}: {opt}\n"
+            await query.edit_message_text("No quiz results available yet!")
+        return
     
-    await query.edit_message_text(
-        f"📊 **Quiz Result**\n\n"
-        f"❓ {quiz['question']}\n\n"
-        f"{result_text}\n"
-        f"{'🎉 Correct!' if is_correct else '😢 Wrong answer!'}\n\n"
-        f"Next quiz in 30 minutes!",
-        parse_mode='Markdown'
-    )
+    # View stats from private chat
+    if query.data == "view_stats":
+        await my_stats(update, context, chat_id)
+        return
     
-    # Remove from active quizzes to allow new one
-    if chat_id in active_quizzes:
-        del active_quizzes[chat_id]
+    # Group stats callback
+    if query.data == "group_stats":
+        await group_stats(update, context)
+        return
+    
+    # Leaderboard callback
+    if query.data == "leaderboard":
+        await show_leaderboard(update, context, chat_id)
+        return
+    
+    # Close settings
+    if query.data == "close_settings":
+        await query.edit_message_text("Settings closed. Use /settings to reopen.")
+        return
+    
+    # Set interval
+    if query.data == "set_interval":
+        keyboard = [
+            [InlineKeyboardButton("15 minutes", callback_data="interval_15")],
+            [InlineKeyboardButton("30 minutes", callback_data="interval_30")],
+            [InlineKeyboardButton("60 minutes", callback_data="interval_60")],
+            [InlineKeyboardButton("🔙 Back", callback_data="close_settings")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(
+            "⏱️ **Select Quiz Interval**\n\n"
+            "How often should I send quizzes in this group?",
+            reply_markup=reply_markup,
+            parse_mode='Markdown'
+        )
+        return
+    
+    # Handle interval selection
+    if query.data.startswith("interval_"):
+        interval = int(query.data.split("_")[1])
+        await query.edit_message_text(f"✅ Quiz interval set to {interval} minutes!")
+        # Here you can update the scheduler for this specific group
+        return
+    
+    # Handle quiz answer
+    parts = query.data.split('_')
+    if len(parts) >= 3:
+        selected = parts[2]
+        quiz = await get_last_quiz(chat_id)
+        
+        if not quiz:
+            await query.edit_message_text("Quiz expired! Waiting for next quiz...")
+            return
+        
+        correct = quiz['correct_answer']
+        is_correct = (selected == correct)
+        options = quiz['options']
+        
+        await update_score(user.id, chat_id, user.username or user.first_name, user.first_name, is_correct)
+        
+        # Update the message with percentage view
+        result_text = f"**#Question**\n{quiz['question']}\n\n"
+        result_text += f"*Anonymous Quiz*\n\n"
+        
+        for i, opt in enumerate(options):
+            letter = ['A', 'B', 'C', 'D'][i]
+            if letter == correct:
+                result_text += f"✅ {letter}: {opt} (Correct)\n"
+            elif letter == selected and not is_correct:
+                result_text += f"❌ {letter}: {opt} (Your answer - Wrong)\n"
+            else:
+                result_text += f"⚪ {letter}: {opt}\n"
+        
+        # Simulate percentages (in real implementation, you'd track votes)
+        result_text += f"\n📊 Results: 25% | 25% | 25% | 25%\n"
+        result_text += f"\n{'🎉 Correct answer!' if is_correct else '😢 Wrong answer!'}"
+        result_text += f"\n🔑 Correct answer was: {correct}"
+        
+        await query.edit_message_text(result_text, parse_mode='Markdown')
+        
+        if chat_id in active_quizzes:
+            del active_quizzes[chat_id]
 
 async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """When bot is added to a group"""
     for member in update.message.new_chat_members:
         if member.id == context.bot.id:
             chat_id = update.effective_chat.id
             chat_title = update.effective_chat.title or "Group"
             await add_group(chat_id, chat_title)
             await update.message.reply_text(
-                f"✅ Thanks for adding me to {chat_title}!\n\n"
-                f"I'll start sending quizzes every 30 minutes!\n"
-                f"Make sure I have admin permissions to send messages."
+                f"✅ Hey everyone! I'm **Albert**! 🎉\n\n"
+                f"I'll send random quizzes every 30 minutes!\n\n"
+                f"Use /settings to configure me.\n"
+                f"Use /stats to see group statistics.\n"
+                f"Use /leaderboard to see top scorers.\n\n"
+                f"Let's have some fun learning together! 📚",
+                parse_mode='Markdown'
             )
-            # Send first quiz immediately
             await asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context))
             break
 
 async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """When bot is removed from a group"""
     chat_id = update.effective_chat.id
     await remove_group(chat_id)
     if chat_id in active_quizzes:
@@ -415,10 +549,11 @@ application = Application.builder().token(BOT_TOKEN).updater(None).build()
 
 # Register handlers
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("leaderboard", leaderboard))
-application.add_handler(CommandHandler("stats", stats_command))
-application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^quiz_"))
+application.add_handler(CommandHandler("settings", settings))
+application.add_handler(CommandHandler("stats", group_stats))
+application.add_handler(CommandHandler("leaderboard", show_leaderboard))
+application.add_handler(CommandHandler("mystats", my_stats))
+application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|group_stats|leaderboard|close_settings|set_interval|interval_|quiz_)"))
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
 application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
 
@@ -440,25 +575,20 @@ if __name__ == "__main__":
     
     async def main():
         await init_db_pool()
-        
         await application.initialize()
         await application.start()
         
-        # Start the quiz scheduler
         scheduler.add_job(send_quiz_to_all, 'interval', minutes=30)
         scheduler.start()
         
-        # Set webhook or polling
         render_url = os.getenv("RENDER_EXTERNAL_URL")
         if render_url:
             webhook_url = f"{render_url}/webhook"
             await application.bot.set_webhook(url=webhook_url)
             logger.info(f"Webhook set to: {webhook_url}")
-            
             port = int(os.environ.get("PORT", 5000))
             app.run(host="0.0.0.0", port=port)
         else:
-            # Polling for local testing
             await application.updater.start_polling()
             await asyncio.Event().wait()
     

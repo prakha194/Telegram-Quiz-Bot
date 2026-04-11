@@ -4,7 +4,6 @@ import asyncio
 import random
 import threading
 import time
-import re
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import (
@@ -151,7 +150,7 @@ async def get_global_group_ranks():
 async def last_quiz(chat_id):
     return await db_pool.fetchrow("SELECT id, question, correct_answer, options FROM quiz_history WHERE chat_id = $1 ORDER BY asked_at DESC LIMIT 1", chat_id)
 
-# -------------------- Gemini --------------------
+# -------------------- Gemini (short quizzes) --------------------
 async def generate_quiz():
     categories = ["Brainstorming", "News", "GK", "Riddle", "Science", "Tech", "World News", "Telegram", "History", "Geography", "Sports"]
     cat = random.choice(categories)
@@ -192,9 +191,9 @@ async def delete_later(bot, chat_id, msg_id, delay=30):
         pass
 
 def escape_md(text):
-    """Escape all MarkdownV2 special characters."""
-    special_chars = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{c}' if c in special_chars else c for c in str(text))
+    """Escape MarkdownV2 special characters (including !)."""
+    special = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{c}' if c in special else c for c in str(text))
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz(chat_id, title, bot):
@@ -240,7 +239,6 @@ async def handle_poll_answer(update, context):
 
 # -------------------- Command Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info(f"Start command from {update.effective_chat.id} type={update.effective_chat.type}")
     if update.effective_chat.type == "private":
         kb = [[InlineKeyboardButton("➕ Add me to a group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
               [InlineKeyboardButton("📊 My Global Stats", callback_data="my_stats")]]

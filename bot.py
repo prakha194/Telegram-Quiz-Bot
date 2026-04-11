@@ -35,12 +35,9 @@ scheduler = AsyncIOScheduler()
 active_quizzes = {}
 db_pool = None
 application = None
-main_loop = None  # Store the main event loop
+main_loop = None  # FIX: store the main event loop for webhook thread use
 
-# Track which users have answered which quiz
-answered_quizzes = {}
-
-# -------------------- Database Functions --------------------
+# -------------------- Database Functions (asyncpg) --------------------
 async def init_db_pool():
     global db_pool
     try:
@@ -76,14 +73,13 @@ async def init_db_pool():
                     PRIMARY KEY (user_id, chat_id)
                 )
             """)
+            # FIX: Add answered_users table to track who already answered current quiz
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS quiz_answers (
-                    id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
                     chat_id BIGINT,
                     quiz_id INTEGER,
-                    answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(user_id, chat_id, quiz_id)
+                    user_id BIGINT,
+                    PRIMARY KEY (chat_id, quiz_id, user_id)
                 )
             """)
         logger.info("Database initialized successfully")
@@ -123,41 +119,40 @@ async def get_active_groups():
 async def save_quiz_history(chat_id, question, correct_answer, options):
     try:
         async with db_pool.acquire() as conn:
-            result = await conn.fetchrow("""
+            quiz_id = await conn.fetchval("""
                 INSERT INTO quiz_history (chat_id, question, correct_answer, options)
                 VALUES ($1, $2, $3, $4)
                 RETURNING id
             """, chat_id, question, correct_answer, options)
-            logger.info(f"Quiz saved for chat: {chat_id} with id: {result['id']}")
-            return result['id']
+            logger.info(f"Quiz saved for chat: {chat_id}, id: {quiz_id}")
+            return quiz_id
     except Exception as e:
         logger.error(f"Save quiz history error: {e}")
         return None
 
-async def has_user_answered(user_id, chat_id, quiz_id):
+# FIX: Track per-quiz answers so scores update correctly
+async def has_user_answered(chat_id, quiz_id, user_id):
     try:
         async with db_pool.acquire() as conn:
-            result = await conn.fetchval("""
-                SELECT 1 FROM quiz_answers 
-                WHERE user_id = $1 AND chat_id = $2 AND quiz_id = $3
-            """, user_id, chat_id, quiz_id)
-            return result is not None
+            row = await conn.fetchrow(
+                "SELECT 1 FROM quiz_answers WHERE chat_id=$1 AND quiz_id=$2 AND user_id=$3",
+                chat_id, quiz_id, user_id
+            )
+            return row is not None
     except Exception as e:
-        logger.error(f"Check user answered error: {e}")
+        logger.error(f"has_user_answered error: {e}")
         return False
 
-async def record_user_answer(user_id, chat_id, quiz_id):
+async def mark_user_answered(chat_id, quiz_id, user_id):
     try:
         async with db_pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO quiz_answers (user_id, chat_id, quiz_id)
+                INSERT INTO quiz_answers (chat_id, quiz_id, user_id)
                 VALUES ($1, $2, $3)
-                ON CONFLICT (user_id, chat_id, quiz_id) DO NOTHING
-            """, user_id, chat_id, quiz_id)
-            return True
+                ON CONFLICT DO NOTHING
+            """, chat_id, quiz_id, user_id)
     except Exception as e:
-        logger.error(f"Record user answer error: {e}")
-        return False
+        logger.error(f"mark_user_answered error: {e}")
 
 async def update_score(user_id, chat_id, username, first_name, is_correct):
     try:
@@ -182,7 +177,7 @@ async def update_score(user_id, chat_id, username, first_name, is_correct):
                         username = EXCLUDED.username,
                         first_name = EXCLUDED.first_name
                 """, user_id, chat_id, username, first_name)
-            logger.info(f"Score updated - User: {user_id}, Chat: {chat_id}, Correct: {is_correct}")
+            logger.info(f"Score updated for user {user_id} in chat {chat_id}: {'correct' if is_correct else 'wrong'}")
     except Exception as e:
         logger.error(f"Update score error: {e}")
 
@@ -246,7 +241,7 @@ async def generate_quiz():
         "Entertainment", "Sports"
     ]
     category = random.choice(categories)
-    
+
     prompt = f"""Generate a multiple choice quiz question about {category}. 
     Format EXACTLY as:
     QUESTION: [the question text]
@@ -255,7 +250,7 @@ async def generate_quiz():
     
     Make it interesting and educational. Difficulty: medium.
     """
-    
+
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(
@@ -273,7 +268,7 @@ async def generate_quiz():
                 question = ""
                 options = []
                 answer = ""
-                
+
                 for line in lines:
                     if line.startswith("QUESTION:"):
                         question = line.replace("QUESTION:", "").strip()
@@ -282,10 +277,10 @@ async def generate_quiz():
                         options = [opt.strip() for opt in options_raw.split("|")]
                     elif line.startswith("ANSWER:"):
                         answer = line.replace("ANSWER:", "").strip().upper()
-                
+
                 if len(options) != 4:
                     options = ["Option A", "Option B", "Option C", "Option D"]
-                
+
                 return {
                     'question': question or f"Quiz about {category}",
                     'options': options,
@@ -308,321 +303,305 @@ async def delete_message_after_delay(bot, chat_id, message_id, delay=30):
         await bot.delete_message(chat_id=chat_id, message_id=message_id)
         logger.info(f"Deleted message {message_id} in chat {chat_id}")
     except Exception as e:
-        logger.error(f"Failed to delete message: {e}")
+        logger.warning(f"Failed to delete message {message_id}: {e}")
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz_to_chat(chat_id, chat_title, bot):
     try:
-        # Delete previous quiz if exists
+        # Delete previous quiz message if exists
         if chat_id in active_quizzes:
             try:
                 await bot.delete_message(
                     chat_id=chat_id,
-                    message_id=active_quizzes[chat_id]
+                    message_id=active_quizzes[chat_id]['message_id']
                 )
-            except:
+            except Exception:
                 pass
-        
+
         quiz = await generate_quiz()
-        
+
         keyboard = [
+            [
+                InlineKeyboardButton("📊 Show Results", callback_data=f"show_results_{chat_id}")
+            ],
             [
                 InlineKeyboardButton("🔴 A", callback_data=f"quiz_{chat_id}_A"),
                 InlineKeyboardButton("🔵 B", callback_data=f"quiz_{chat_id}_B"),
                 InlineKeyboardButton("🟢 C", callback_data=f"quiz_{chat_id}_C"),
                 InlineKeyboardButton("🟡 D", callback_data=f"quiz_{chat_id}_D")
-            ],
-            [
-                InlineKeyboardButton("📊 Show Results", callback_data=f"show_results_{chat_id}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        
+
         options_text = ""
         for i, opt in enumerate(quiz['options']):
             letter = ['A', 'B', 'C', 'D'][i]
             emoji = ["🔴", "🔵", "🟢", "🟡"][i]
             options_text += f"{emoji} {letter}: {opt}\n"
-        
+
         message_text = (
-            f"**#Question**\n"
+            f"*#Question*\n"
             f"{quiz['question']}\n\n"
-            f"*Anonymous Quiz*\n\n"
+            f"_Anonymous Quiz_\n\n"
             f"{options_text}\n"
-            f"Click on A, B, C, or D to answer!\n\n"
-            f"⏰ This quiz will auto-delete in 5 minutes!"
+            f"⏰ This quiz will auto\\-delete in 5 minutes\\!"
         )
-        
+
         sent_msg = await bot.send_message(
             chat_id=chat_id,
             text=message_text,
             reply_markup=reply_markup,
-            parse_mode='Markdown'
+            parse_mode='MarkdownV2'
         )
-        
+
+        # FIX: Save quiz_id alongside message_id so answers match the right quiz
         quiz_id = await save_quiz_history(chat_id, quiz['question'], quiz['correct'], quiz['options'])
-        
         active_quizzes[chat_id] = {
             'message_id': sent_msg.message_id,
             'quiz_id': quiz_id
         }
-        logger.info(f"Quiz sent to {chat_title} ({chat_id}) with id: {quiz_id}")
-        
-        # Auto-delete bot's quiz message after 5 minutes (300 seconds)
+        logger.info(f"Quiz sent to {chat_title} ({chat_id}), quiz_id={quiz_id}")
+
+        # Auto-delete quiz message after 5 minutes
         asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 300))
-        
+
     except Exception as e:
         logger.error(f"Failed to send quiz to {chat_id}: {e}")
 
-async def send_quiz_to_all():
-    """Send quiz to all active groups - this runs every 5 minutes"""
+async def send_quiz_to_all(bot):
     groups = await get_active_groups()
     logger.info(f"Sending quizzes to {len(groups)} active groups")
     for group in groups:
-        chat_id = group['chat_id']
-        chat_title = group['chat_title']
-        await send_quiz_to_chat(chat_id, chat_title, application.bot)
+        await send_quiz_to_chat(group['chat_id'], group['chat_title'], bot)
 
 # -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
     chat_type = update.effective_chat.type
-    
-    keyboard = [
-        [InlineKeyboardButton("📊 View your stats", callback_data="view_stats")]
-    ]
-    
-    # Only show "Add to chat" button in private chat
+
+    # FIX: "Add me to your chat" button only in private chat
     if chat_type == "private":
-        keyboard.insert(0, [InlineKeyboardButton("➕ Add me to your chat", url=f"https://t.me/{context.bot.username}?startgroup=true")])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    sent_msg = await update.message.reply_text(
-        f"Hey there! My name is **Albert**. I am a multi-language quiz bot that sends random quizzes in groups.\n\n"
-        f"*Powered by Sybotik.*",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    
-    # Auto-delete bot's welcome message after 30 seconds (only in groups)
-    if chat_type != "private":
+        bot_username = context.bot.username
+        keyboard = [
+            [InlineKeyboardButton("➕ Add me to your chat", url=f"https://t.me/{bot_username}?startgroup=true")],
+            [InlineKeyboardButton("📊 View your stats", callback_data="view_stats")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"Hey there\\! My name is *Albert*\\. I am a multi\\-language quiz bot that sends random quizzes in groups\\.\n\n"
+            f"*Powered by Sybotik\\.*",
+            reply_markup=reply_markup,
+            parse_mode='MarkdownV2'
+        )
+    else:
+        # In groups: just a brief greeting, no "add to group" button
+        sent_msg = await update.message.reply_text(
+            f"Hey\\! I'm *Albert*, your quiz bot\\! 🎉\n\n"
+            f"I'll send quizzes every 5 minutes\\!\n\n"
+            f"Use /stats to see group statistics\\.\n"
+            f"Use /leaderboard to see top scorers\\.\n"
+            f"Use /mystats to see your personal stats\\.",
+            parse_mode='MarkdownV2'
+        )
+        # Auto-delete in groups after 30s
         asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, update.effective_message.message_id, 30))
 
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or "This group"
     bot = context.bot
-    
+
     total_participants, total_quizzes, total_answers = await get_group_stats(chat_id)
-    
+
     sent_msg = await update.effective_message.reply_text(
-        f"📊 **Group Statistics for {chat_title}**\n\n"
+        f"📊 *Group Statistics for {chat_title}*\n\n"
         f"👥 Total participants: {total_participants}\n"
         f"📝 Total quizzes sent: {total_quizzes}\n"
         f"🎯 Total answers given: {total_answers}\n\n"
-        f"Keep participating to improve your score! 💪",
-        parse_mode='Markdown'
+        f"Keep participating to improve your score\\! 💪",
+        parse_mode='MarkdownV2'
     )
-    
-    asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-    asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
+
+    if update.effective_chat.type != "private":
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or "this group"
     bot = context.bot
-    
+
     stats = await get_user_stats(user.id, chat_id)
-    
+
     if stats:
         correct = stats['correct_answers']
         wrong = stats['wrong_answers']
         total = stats['total_attempts']
         accuracy = round((correct * 100.0 / total), 1) if total > 0 else 0
-        
+
         if accuracy >= 80:
-            motivation = "🌟 Excellent! You're a quiz master! Keep shining!"
+            motivation = "🌟 Excellent\\! You're a quiz master\\! Keep shining\\!"
         elif accuracy >= 60:
-            motivation = "🎉 Great job! You're doing really well!"
+            motivation = "🎉 Great job\\! You're doing really well\\!"
         elif accuracy >= 40:
-            motivation = "👍 Good effort! Practice makes perfect!"
+            motivation = "👍 Good effort\\! Practice makes perfect\\!"
         elif accuracy >= 20:
-            motivation = "💪 Keep going! Every quiz makes you smarter!"
+            motivation = "💪 Keep going\\! Every quiz makes you smarter\\!"
         else:
-            motivation = "🌱 You're just getting started! Try more quizzes to improve!"
-        
+            motivation = "🌱 You're just getting started\\! Try more quizzes to improve\\!"
+
         sent_msg = await update.effective_message.reply_text(
-            f"📊 **Your Stats in {chat_title}**\n\n"
+            f"📊 *Your Stats in {chat_title}*\n\n"
             f"👤 Name: {user.first_name}\n"
-            f"🆔 ID: {user.id}\n\n"
+            f"🆔 ID: `{user.id}`\n\n"
             f"✅ Correct answers: {correct}\n"
             f"❌ Wrong answers: {wrong}\n"
             f"📊 Total attempts: {total}\n"
             f"🎯 Accuracy: {accuracy}%\n\n"
-            f"💬 {motivation}",
-            parse_mode='Markdown'
+            f"💬 {motivation}\n\n"
+            f"Keep participating\\! You can do better\\! 💪",
+            parse_mode='MarkdownV2'
         )
     else:
         sent_msg = await update.effective_message.reply_text(
-            f"📊 **Your Stats in {chat_title}**\n\n"
+            f"📊 *Your Stats in {chat_title}*\n\n"
             f"👤 Name: {user.first_name}\n"
-            f"🆔 ID: {user.id}\n\n"
+            f"🆔 ID: `{user.id}`\n\n"
             f"✅ Correct answers: 0\n"
             f"❌ Wrong answers: 0\n"
             f"📊 Total attempts: 0\n"
             f"🎯 Accuracy: 0%\n\n"
-            f"🌱 You haven't participated in any quiz yet!\n"
-            f"💬 Answer the next quiz to get started! 🚀",
-            parse_mode='Markdown'
+            f"🌱 You haven't participated in any quiz yet\\!\n"
+            f"💬 Answer the next quiz to get started\\! 🚀",
+            parse_mode='MarkdownV2'
         )
-    
-    asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-    asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
+
+    if update.effective_chat.type != "private":
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     bot = context.bot
-    
+
     leaderboard_data = await get_leaderboard(chat_id)
-    
+
     if not leaderboard_data:
         sent_msg = await update.effective_message.reply_text(
-            "🏆 **Leaderboard**\n\n"
-            "No scores yet! Be the first to answer a quiz! 🚀",
-            parse_mode='Markdown'
+            "🏆 *Leaderboard*\n\nNo scores yet\\! Be the first to answer a quiz\\! 🚀",
+            parse_mode='MarkdownV2'
         )
     else:
-        message = "🏆 **Leaderboard** 🏆\n\n"
-        for i, user in enumerate(leaderboard_data, 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
-            name = user['first_name'] or user['username'] or "Anonymous"
-            accuracy = user['accuracy'] or 0
-            message += f"{medal} {name}: {user['correct_answers']} ✅ / {user['wrong_answers']} ❌ (Accuracy: {accuracy}%)\n"
-        
-        message += f"\n💬 {random.choice(['Keep going!', 'You can do better!', 'Next time you will win!', 'Practice makes perfect!'])}"
-        
-        sent_msg = await update.effective_message.reply_text(message, parse_mode='Markdown')
-    
-    asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-    asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
+        message = "🏆 *Leaderboard* 🏆\n\n"
+        for i, row in enumerate(leaderboard_data, 1):
+            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}\\."
+            name = row['first_name'] or row['username'] or "Anonymous"
+            accuracy = row['accuracy'] or 0
+            message += f"{medal} {name}: {row['correct_answers']} ✅ / {row['wrong_answers']} ❌ \\(Accuracy: {accuracy}%\\)\n"
+
+        message += f"\n💬 {random.choice(['Keep going\\!', 'You can do better\\!', 'Next time you will win\\!', 'Practice makes perfect\\!'])}"
+
+        sent_msg = await update.effective_message.reply_text(message, parse_mode='MarkdownV2')
+
+    if update.effective_chat.type != "private":
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    await query.answer()
+
     user = update.effective_user
     chat_id = update.effective_chat.id
     bot = context.bot
-    
+
     # Show results button
     if query.data.startswith("show_results_"):
         quiz = await get_last_quiz(chat_id)
         if quiz:
             options = quiz['options']
-            result_text = f"**📊 Quiz Results**\n\n"
-            result_text += f"❓ {quiz['question']}\n\n"
+            result_text = f"*📊 Quiz Results*\n\n❓ {quiz['question']}\n\n"
             for i, opt in enumerate(options):
                 letter = ['A', 'B', 'C', 'D'][i]
-                result_text += f"✅ {letter}: {opt}\n"
-            result_text += f"\n🔑 Correct answer: {quiz['correct_answer']}"
-            sent_msg = await query.edit_message_text(result_text, parse_mode='Markdown')
-            asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+                result_text += f"{'✅' if letter == quiz['correct_answer'] else '⚪'} {letter}: {opt}\n"
+            result_text += f"\n🔑 Correct answer: *{quiz['correct_answer']}*"
+            try:
+                sent_msg = await query.edit_message_text(result_text, parse_mode='MarkdownV2')
+                asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+            except Exception as e:
+                logger.warning(f"edit_message_text error: {e}")
         else:
-            sent_msg = await query.edit_message_text("No quiz results available yet!")
-            asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-        await query.answer()
+            try:
+                await query.edit_message_text("No quiz results available yet\\!", parse_mode='MarkdownV2')
+            except Exception:
+                pass
         return
-    
-    # View stats from private chat - FIXED: Don't modify update directly
+
+    # View stats from private chat
     if query.data == "view_stats":
-        await query.answer()
-        # Get user stats and send as a new message
-        stats = await get_user_stats(user.id, chat_id)
-        chat_title = update.effective_chat.title or "this group"
-        
-        if stats:
-            correct = stats['correct_answers']
-            wrong = stats['wrong_answers']
-            total = stats['total_attempts']
-            accuracy = round((correct * 100.0 / total), 1) if total > 0 else 0
-            
-            if accuracy >= 80:
-                motivation = "🌟 Excellent! You're a quiz master! Keep shining!"
-            elif accuracy >= 60:
-                motivation = "🎉 Great job! You're doing really well!"
-            elif accuracy >= 40:
-                motivation = "👍 Good effort! Practice makes perfect!"
-            elif accuracy >= 20:
-                motivation = "💪 Keep going! Every quiz makes you smarter!"
-            else:
-                motivation = "🌱 You're just getting started! Try more quizzes to improve!"
-            
-            sent_msg = await query.message.reply_text(
-                f"📊 **Your Stats in {chat_title}**\n\n"
-                f"👤 Name: {user.first_name}\n"
-                f"🆔 ID: {user.id}\n\n"
-                f"✅ Correct answers: {correct}\n"
-                f"❌ Wrong answers: {wrong}\n"
-                f"📊 Total attempts: {total}\n"
-                f"🎯 Accuracy: {accuracy}%\n\n"
-                f"💬 {motivation}",
-                parse_mode='Markdown'
-            )
-        else:
-            sent_msg = await query.message.reply_text(
-                f"📊 **Your Stats in {chat_title}**\n\n"
-                f"👤 Name: {user.first_name}\n"
-                f"🆔 ID: {user.id}\n\n"
-                f"✅ Correct answers: 0\n"
-                f"❌ Wrong answers: 0\n"
-                f"📊 Total attempts: 0\n"
-                f"🎯 Accuracy: 0%\n\n"
-                f"🌱 You haven't participated in any quiz yet!\n"
-                f"💬 Answer the next quiz to get started! 🚀",
-                parse_mode='Markdown'
-            )
-        
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        await my_stats(update, context)
         return
-    
-    # Handle quiz answer
+
+    # Group stats callback
+    if query.data == "group_stats":
+        await group_stats(update, context)
+        return
+
+    # Leaderboard callback
+    if query.data == "leaderboard":
+        await leaderboard(update, context)
+        return
+
+    # Handle quiz answer: quiz_{chat_id}_{letter}
     parts = query.data.split('_')
-    if len(parts) >= 3:
+    if len(parts) >= 3 and parts[0] == "quiz":
         selected = parts[2]
         quiz = await get_last_quiz(chat_id)
-        
+
         if not quiz:
-            await query.answer("Quiz expired! Waiting for next quiz...", show_alert=True)
+            try:
+                await query.answer("Quiz expired\\! Waiting for next quiz\\...", show_alert=True)
+            except Exception:
+                pass
             return
-        
-        # Check if user already answered this quiz
-        already_answered = await has_user_answered(user.id, chat_id, quiz['id'])
-        
+
+        quiz_id = quiz['id']
+
+        # FIX: Check if user already answered this quiz — prevent duplicate score updates
+        already_answered = await has_user_answered(chat_id, quiz_id, user.id)
         if already_answered:
-            await query.answer("❌ You already answered this quiz!", show_alert=True)
+            await query.answer("You already answered this quiz!", show_alert=True)
             return
-        
+
+        # Mark user as answered BEFORE updating score to prevent race conditions
+        await mark_user_answered(chat_id, quiz_id, user.id)
+
         correct = quiz['correct_answer']
         is_correct = (selected == correct)
-        
-        # Record that user answered
-        await record_user_answer(user.id, chat_id, quiz['id'])
-        
-        # Update score
+        options = quiz['options']
+
+        # FIX: Update score properly now
         await update_score(user.id, chat_id, user.username or user.first_name, user.first_name, is_correct)
-        
-        # Send personal result as popup alert
-        if is_correct:
-            await query.answer(f"✅ Correct! 🎉\n\nThe answer was {correct}. +1 point!", show_alert=True)
-        else:
-            await query.answer(f"❌ Wrong!\n\nCorrect answer was {correct}. Better luck next time!", show_alert=True)
-        
-        # Also send a brief auto-deleted message in chat
-        result_msg = await query.message.reply_text(
-            f"{user.first_name} answered: {'✅ Correct!' if is_correct else '❌ Wrong!'}",
-            parse_mode='Markdown'
+
+        # Send personal result as an alert — doesn't edit quiz for others
+        result_line = "🎉 Correct answer!" if is_correct else f"😢 Wrong! Correct was: {correct}"
+        await query.answer(result_line, show_alert=True)
+
+        # Also send a short result message visible to chat, auto-deleted in 15s
+        result_text = (
+            f"👤 *{user.first_name}* answered *{selected}* — "
+            f"{'✅ Correct\\!' if is_correct else f'❌ Wrong\\! Correct: *{correct}*'}"
         )
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, result_msg.message_id, 5))
+        try:
+            sent_msg = await context.bot.send_message(
+                chat_id=chat_id,
+                text=result_text,
+                parse_mode='MarkdownV2'
+            )
+            asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 15))
+        except Exception as e:
+            logger.warning(f"Could not send answer result: {e}")
 
 async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
@@ -631,16 +610,16 @@ async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_title = update.effective_chat.title or "Group"
             await add_group(chat_id, chat_title)
             sent_msg = await update.message.reply_text(
-                f"✅ Hey everyone! I'm **Albert**! 🎉\n\n"
-                f"I'll send random quizzes every 5 minutes!\n\n"
-                f"Use /stats to see group statistics.\n"
-                f"Use /leaderboard to see top scorers.\n\n"
-                f"Let's have some fun learning together! 📚",
-                parse_mode='Markdown'
+                f"✅ Hey everyone\\! I'm *Albert*\\! 🎉\n\n"
+                f"I'll send random quizzes every 5 minutes\\!\n\n"
+                f"Use /stats to see group statistics\\.\n"
+                f"Use /leaderboard to see top scorers\\.\n\n"
+                f"Let's have some fun learning together\\! 📚",
+                parse_mode='MarkdownV2'
             )
             asyncio.create_task(delete_message_after_delay(context.bot, chat_id, sent_msg.message_id, 30))
             # Send first quiz immediately
-            await asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context.bot))
+            asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context.bot))
             break
 
 async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -659,17 +638,20 @@ def webhook():
     global application, main_loop
     try:
         data = request.get_json(force=True)
+        logger.info(f"Update received: {data.get('update_id', 'unknown')}")
+
         update = Update.de_json(data, application.bot)
-        
-        # Use run_coroutine_threadsafe to submit to the main event loop
-        asyncio.run_coroutine_threadsafe(
+
+        # FIX: Use the stored main_loop to safely submit coroutine from this thread
+        future = asyncio.run_coroutine_threadsafe(
             application.process_update(update),
             main_loop
         )
-        
+        future.result(timeout=30)  # Wait up to 30s for processing
+
         return jsonify({"ok": True})
     except Exception as e:
-        print("Webhook error:", e)
+        logger.error(f"Webhook error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
@@ -679,54 +661,65 @@ def index():
 # -------------------- Main Entry --------------------
 async def main():
     global application, main_loop
-    
-    main_loop = asyncio.get_running_loop()
-    
+
+    # FIX: Store the running event loop so Flask thread can use it
+    main_loop = asyncio.get_event_loop()
+
     await init_db_pool()
-    
+
     application = create_application()
-    
-    # Register handlers
+
+    # FIX: Removed /settings handler. Commands registered:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("stats", group_stats))
     application.add_handler(CommandHandler("leaderboard", leaderboard))
     application.add_handler(CommandHandler("mystats", my_stats))
-    application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|quiz_)"))
+    application.add_handler(CallbackQueryHandler(
+        quiz_callback,
+        pattern="^(show_results_|view_stats|group_stats|leaderboard|quiz_)"
+    ))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
     application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
-    
+
     await application.initialize()
     await application.start()
-    await application.bot.initialize()
     logger.info("Application initialized and started")
-    
-    # Start scheduler - Quiz every 5 MINUTES
-    scheduler.add_job(send_quiz_to_all, 'interval', minutes=5)
+
+    # Start scheduler — Quiz every 5 minutes
+    async def scheduled_quiz():
+        await send_quiz_to_all(application.bot)
+
+    scheduler.add_job(scheduled_quiz, 'interval', minutes=5)
     scheduler.start()
-    logger.info("Scheduler started - quizzes every 5 minutes")
-    
+    logger.info("Scheduler started — quizzes every 5 minutes")
+
     # Set webhook
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if not render_url:
         raise Exception("RENDER_EXTERNAL_URL not set")
-    
+
     webhook_url = f"{render_url}/webhook"
     await application.bot.set_webhook(url=webhook_url)
-    print("Webhook set:", webhook_url)
     logger.info(f"Webhook set to: {webhook_url}")
 
 def run_flask():
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 if __name__ == "__main__":
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    # FIX: Run main() first to initialize everything including main_loop
     loop.run_until_complete(main())
-    
-    threading.Thread(target=run_flask).start()
-    
+
+    # Start Flask in a separate thread AFTER main_loop is set
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
     try:
         loop.run_forever()
     except KeyboardInterrupt:
         logger.info("Shutting down...")
+        scheduler.shutdown()
+        loop.run_until_complete(application.stop())

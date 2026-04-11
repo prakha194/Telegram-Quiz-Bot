@@ -35,7 +35,10 @@ scheduler = AsyncIOScheduler()
 active_quizzes = {}
 db_pool = None
 application = None
-quiz_sent_flag = {}  # Track if quiz sent for each group
+main_loop = None  # Store the main event loop
+
+# Track which users have answered which quiz
+answered_quizzes = {}
 
 # -------------------- Database Functions --------------------
 async def init_db_pool():
@@ -71,6 +74,16 @@ async def init_db_pool():
                     wrong_answers INTEGER DEFAULT 0,
                     total_attempts INTEGER DEFAULT 0,
                     PRIMARY KEY (user_id, chat_id)
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS quiz_answers (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    chat_id BIGINT,
+                    quiz_id INTEGER,
+                    answered_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(user_id, chat_id, quiz_id)
                 )
             """)
         logger.info("Database initialized successfully")
@@ -110,13 +123,41 @@ async def get_active_groups():
 async def save_quiz_history(chat_id, question, correct_answer, options):
     try:
         async with db_pool.acquire() as conn:
-            await conn.execute("""
+            result = await conn.fetchrow("""
                 INSERT INTO quiz_history (chat_id, question, correct_answer, options)
                 VALUES ($1, $2, $3, $4)
+                RETURNING id
             """, chat_id, question, correct_answer, options)
-            logger.info(f"Quiz saved for chat: {chat_id}")
+            logger.info(f"Quiz saved for chat: {chat_id} with id: {result['id']}")
+            return result['id']
     except Exception as e:
         logger.error(f"Save quiz history error: {e}")
+        return None
+
+async def has_user_answered(user_id, chat_id, quiz_id):
+    try:
+        async with db_pool.acquire() as conn:
+            result = await conn.fetchval("""
+                SELECT 1 FROM quiz_answers 
+                WHERE user_id = $1 AND chat_id = $2 AND quiz_id = $3
+            """, user_id, chat_id, quiz_id)
+            return result is not None
+    except Exception as e:
+        logger.error(f"Check user answered error: {e}")
+        return False
+
+async def record_user_answer(user_id, chat_id, quiz_id):
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO quiz_answers (user_id, chat_id, quiz_id)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, chat_id, quiz_id) DO NOTHING
+            """, user_id, chat_id, quiz_id)
+            return True
+    except Exception as e:
+        logger.error(f"Record user answer error: {e}")
+        return False
 
 async def update_score(user_id, chat_id, username, first_name, is_correct):
     try:
@@ -187,7 +228,7 @@ async def get_last_quiz(chat_id):
     try:
         async with db_pool.acquire() as conn:
             return await conn.fetchrow("""
-                SELECT question, correct_answer, options 
+                SELECT id, question, correct_answer, options 
                 FROM quiz_history 
                 WHERE chat_id = $1 
                 ORDER BY asked_at DESC 
@@ -308,7 +349,7 @@ async def send_quiz_to_chat(chat_id, chat_title, bot):
             f"{quiz['question']}\n\n"
             f"*Anonymous Quiz*\n\n"
             f"{options_text}\n"
-            f"0% Ans 1 | 0% Ans 2 | 0% Ans 3 | 0% Ans 4\n\n"
+            f"Click on A, B, C, or D to answer!\n\n"
             f"⏰ This quiz will auto-delete in 5 minutes!"
         )
         
@@ -319,9 +360,13 @@ async def send_quiz_to_chat(chat_id, chat_title, bot):
             parse_mode='Markdown'
         )
         
-        active_quizzes[chat_id] = sent_msg.message_id
-        await save_quiz_history(chat_id, quiz['question'], quiz['correct'], quiz['options'])
-        logger.info(f"Quiz sent to {chat_title} ({chat_id})")
+        quiz_id = await save_quiz_history(chat_id, quiz['question'], quiz['correct'], quiz['options'])
+        
+        active_quizzes[chat_id] = {
+            'message_id': sent_msg.message_id,
+            'quiz_id': quiz_id
+        }
+        logger.info(f"Quiz sent to {chat_title} ({chat_id}) with id: {quiz_id}")
         
         # Auto-delete bot's quiz message after 5 minutes (300 seconds)
         asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 300))
@@ -465,8 +510,6 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
-    
     user = update.effective_user
     chat_id = update.effective_chat.id
     bot = context.bot
@@ -487,10 +530,12 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             sent_msg = await query.edit_message_text("No quiz results available yet!")
             asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        await query.answer()
         return
     
     # View stats from private chat
     if query.data == "view_stats":
+        await query.answer()
         # Create a fake message object for stats
         update.effective_message = query.message
         await my_stats(update, context)
@@ -503,37 +548,37 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quiz = await get_last_quiz(chat_id)
         
         if not quiz:
-            sent_msg = await query.edit_message_text("Quiz expired! Waiting for next quiz...")
-            asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+            await query.answer("Quiz expired! Waiting for next quiz...", show_alert=True)
+            return
+        
+        # Check if user already answered this quiz
+        already_answered = await has_user_answered(user.id, chat_id, quiz['id'])
+        
+        if already_answered:
+            await query.answer("❌ You already answered this quiz!", show_alert=True)
             return
         
         correct = quiz['correct_answer']
         is_correct = (selected == correct)
-        options = quiz['options']
         
+        # Record that user answered
+        await record_user_answer(user.id, chat_id, quiz['id'])
+        
+        # Update score
         await update_score(user.id, chat_id, user.username or user.first_name, user.first_name, is_correct)
         
-        result_text = f"**#Question**\n{quiz['question']}\n\n"
-        result_text += f"*Anonymous Quiz*\n\n"
+        # Send personal result as popup alert
+        if is_correct:
+            await query.answer(f"✅ Correct! 🎉\n\nThe answer was {correct}. +1 point!", show_alert=True)
+        else:
+            await query.answer(f"❌ Wrong!\n\nCorrect answer was {correct}. Better luck next time!", show_alert=True)
         
-        for i, opt in enumerate(options):
-            letter = ['A', 'B', 'C', 'D'][i]
-            if letter == correct:
-                result_text += f"✅ {letter}: {opt} (Correct)\n"
-            elif letter == selected and not is_correct:
-                result_text += f"❌ {letter}: {opt} (Your answer - Wrong)\n"
-            else:
-                result_text += f"⚪ {letter}: {opt}\n"
-        
-        result_text += f"\n📊 Results: 25% | 25% | 25% | 25%\n"
-        result_text += f"\n{'🎉 Correct answer!' if is_correct else '😢 Wrong answer!'}"
-        result_text += f"\n🔑 Correct answer was: {correct}"
-        
-        sent_msg = await query.edit_message_text(result_text, parse_mode='Markdown')
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-        
-        if chat_id in active_quizzes:
-            del active_quizzes[chat_id]
+        # Also send a brief auto-deleted message in chat
+        result_msg = await query.message.reply_text(
+            f"{user.first_name} answered: {'✅ Correct!' if is_correct else '❌ Wrong!'}",
+            parse_mode='Markdown'
+        )
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, result_msg.message_id, 5))
 
 async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
@@ -567,11 +612,17 @@ def create_application():
 # -------------------- Flask Webhook --------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global application
+    global application, main_loop
     try:
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
-        asyncio.run(application.process_update(update))
+        
+        # Use run_coroutine_threadsafe to submit to the main event loop
+        asyncio.run_coroutine_threadsafe(
+            application.process_update(update),
+            main_loop
+        )
+        
         return jsonify({"ok": True})
     except Exception as e:
         print("Webhook error:", e)
@@ -583,7 +634,9 @@ def index():
 
 # -------------------- Main Entry --------------------
 async def main():
-    global application
+    global application, main_loop
+    
+    main_loop = asyncio.get_running_loop()
     
     await init_db_pool()
     

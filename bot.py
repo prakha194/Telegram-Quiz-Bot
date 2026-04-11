@@ -4,7 +4,7 @@ import asyncio
 import random
 import threading
 from flask import Flask, request, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -159,9 +159,9 @@ async def update_score(user_id, chat_id, username, first_name, is_correct):
                     VALUES ($1, $2, $3, $4, 1, 0, 1)
                     ON CONFLICT (user_id, chat_id) DO UPDATE
                     SET correct_answers = user_scores.correct_answers + 1,
-                        total_attempts = user_scores.total_attempts + 1,
-                        username = EXCLUDED.username,
-                        first_name = EXCLUDED.first_name
+                        total_attempts  = user_scores.total_attempts + 1,
+                        username        = EXCLUDED.username,
+                        first_name      = EXCLUDED.first_name
                 """, user_id, chat_id, username, first_name)
             else:
                 await conn.execute("""
@@ -170,8 +170,8 @@ async def update_score(user_id, chat_id, username, first_name, is_correct):
                     ON CONFLICT (user_id, chat_id) DO UPDATE
                     SET wrong_answers = user_scores.wrong_answers + 1,
                         total_attempts = user_scores.total_attempts + 1,
-                        username = EXCLUDED.username,
-                        first_name = EXCLUDED.first_name
+                        username       = EXCLUDED.username,
+                        first_name     = EXCLUDED.first_name
                 """, user_id, chat_id, username, first_name)
     except Exception as e:
         logger.error(f"Update score error: {e}")
@@ -255,12 +255,11 @@ async def generate_quiz():
     categories = [
         "General Knowledge", "Science", "Technology", "World News",
         "Telegram", "Current Affairs", "History", "Geography",
-        "Entertainment", "Sports", "Art", "Music", "Movies", "Programming"
+        "Entertainment", "Sports"
     ]
     category = random.choice(categories)
-    # Add a random number to avoid caching
     random_seed = random.randint(1, 1000000)
-    prompt = f"""Generate a multiple choice quiz question about {category}. 
+    prompt = f"""Generate a multiple choice quiz question about {category}.
 Use this random seed to ensure uniqueness: {random_seed}
 Format EXACTLY as:
 QUESTION: [the question text]
@@ -427,7 +426,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         sent_msg = await update.message.reply_text(
             "Hey\\! I'm *Albert*, your quiz bot\\! 🎉\n\n"
-            "I'll send quizzes every 5 minutes using Telegram's native poll\\!\n\n"
+            "I'll send quizzes every 5 minutes using Telegram's native polls\\!\n\n"
             "Use /stats to see group statistics\\.\n"
             "Use /leaderboard to see top scorers\\.\n"
             "Use /mystats to see your personal stats\\.\n"
@@ -438,14 +437,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, update.effective_message.message_id, 30))
 
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id   = update.effective_chat.id
     chat_type = update.effective_chat.type
-    bot = context.bot
+    bot       = context.bot
 
     if chat_type == "private":
-        await update.message.reply_text(
-            "ℹ️ *Group stats are only available inside a group.*\n\n"
-            "Go to a group where I am added and use /stats there.",
+        await update.effective_message.reply_text(
+            "ℹ️ *Group stats are only available inside a group\\.*\n\n"
+            "Go to a group where I am added and use /stats there\\.",
             parse_mode='MarkdownV2'
         )
         return
@@ -465,14 +464,16 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
-    bot = context.bot
+    user      = update.effective_user
+    chat_id   = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    bot       = context.bot
 
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
-            "ℹ️ *Your quiz stats are tied to each group.*\n\n"
-            "Go to a group where I am added and use /mystats there to see your stats.",
+    # In private chat: redirect to group
+    if chat_type == "private":
+        await update.effective_message.reply_text(
+            "ℹ️ *Your quiz stats are tied to each group\\.*\n\n"
+            "Go to a group where I am added and use /mystats there to see your stats\\.",
             parse_mode='MarkdownV2'
         )
         return
@@ -481,21 +482,21 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     stats = await get_user_stats(user.id, chat_id)
 
     if stats and stats['total_attempts'] > 0:
-        correct = stats['correct_answers']
-        wrong = stats['wrong_answers']
-        total = stats['total_attempts']
+        correct  = stats['correct_answers']
+        wrong    = stats['wrong_answers']
+        total    = stats['total_attempts']
         accuracy = round((correct * 100.0 / total), 1)
 
         if accuracy >= 80:
-            motivation = "🌟 Excellent! You're a quiz master!"
+            motivation = "🌟 Excellent\\! You're a quiz master\\!"
         elif accuracy >= 60:
-            motivation = "🎉 Great job! You're doing really well!"
+            motivation = "🎉 Great job\\! You're doing really well\\!"
         elif accuracy >= 40:
-            motivation = "👍 Good effort! Practice makes perfect!"
+            motivation = "👍 Good effort\\! Practice makes perfect\\!"
         elif accuracy >= 20:
-            motivation = "💪 Keep going! Every quiz makes you smarter!"
+            motivation = "💪 Keep going\\! Every quiz makes you smarter\\!"
         else:
-            motivation = "🌱 Keep trying! You're improving!"
+            motivation = "🌱 Keep trying\\! You're improving\\!"
 
         sent_msg = await update.effective_message.reply_text(
             f"📊 *Your Stats in {escape_md(chat_title)}*\n\n"
@@ -513,8 +514,8 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 *Your Stats in {escape_md(chat_title)}*\n\n"
             f"👤 Name: {escape_md(user.first_name)}\n"
             f"🆔 ID: `{user.id}`\n\n"
-            f"You haven't answered any quiz yet!\n"
-            f"Answer the next quiz to get started! 🚀",
+            f"You haven't answered any quiz yet\\!\n"
+            f"Answer the next quiz to get started\\! 🚀",
             parse_mode='MarkdownV2'
         )
 
@@ -522,13 +523,14 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    bot = context.bot
+    chat_id   = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    bot       = context.bot
 
-    if update.effective_chat.type == "private":
-        await update.message.reply_text(
-            "ℹ️ *Leaderboard is only available inside a group.*\n\n"
-            "Go to a group where I am added and use /leaderboard there.",
+    if chat_type == "private":
+        await update.effective_message.reply_text(
+            "ℹ️ *Leaderboard is only available inside a group\\.*\n\n"
+            "Go to a group where I am added and use /leaderboard there\\.",
             parse_mode='MarkdownV2'
         )
         return
@@ -537,18 +539,18 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not leaderboard_data:
         sent_msg = await update.effective_message.reply_text(
-            "🏆 *Leaderboard*\n\nNo scores yet! Be the first to answer a quiz! 🚀",
+            "🏆 *Leaderboard*\n\nNo scores yet\\! Be the first to answer a quiz\\! 🚀",
             parse_mode='MarkdownV2'
         )
     else:
         message = "🏆 *Leaderboard* 🏆\n\n"
         for i, row in enumerate(leaderboard_data, 1):
-            medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}\\."
-            name = escape_md(row['first_name'] or row['username'] or "Anonymous")
+            medal    = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}\\."
+            name     = escape_md(row['first_name'] or row['username'] or "Anonymous")
             accuracy = row['accuracy'] or 0
-            message += f"{medal} {name}: {row['correct_answers']} ✅ / {row['wrong_answers']} ❌ (Accuracy: {accuracy}%)\n"
+            message += f"{medal} {name}: {row['correct_answers']} ✅ / {row['wrong_answers']} ❌ \\(Accuracy: {accuracy}%\\)\n"
 
-        endings = ['Keep going!', 'You can do better!', 'Next time you will win!', 'Practice makes perfect!']
+        endings = ['Keep going\\!', 'You can do better\\!', 'Next time you will win\\!', 'Practice makes perfect\\!']
         message += f"\n💬 {random.choice(endings)}"
         sent_msg = await update.effective_message.reply_text(message, parse_mode='MarkdownV2')
 
@@ -602,20 +604,20 @@ async def group_rank(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # This callback is only for the "View your stats" button in private chat
+    # Only the "View your stats" button is left from private chat
     query = update.callback_query
     await query.answer()
     if query.data == "view_stats":
         await query.message.reply_text(
-            "ℹ️ *Your quiz stats are tied to each group.*\n\n"
-            "Go to a group where I am added and use /mystats there to see your stats.",
+            "ℹ️ *Your quiz stats are tied to each group\\.*\n\n"
+            "Go to a group where I am added and use /mystats there to see your stats\\.",
             parse_mode='MarkdownV2'
         )
 
 async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:
         if member.id == context.bot.id:
-            chat_id = update.effective_chat.id
+            chat_id    = update.effective_chat.id
             chat_title = update.effective_chat.title or "Group"
             await add_group(chat_id, chat_title)
             sent_msg = await update.message.reply_text(
@@ -641,7 +643,7 @@ async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 def webhook():
     global application, main_loop
     try:
-        data = request.get_json(force=True)
+        data   = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
         future = asyncio.run_coroutine_threadsafe(
             application.process_update(update),
@@ -666,15 +668,15 @@ async def main():
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("stats", group_stats))
+    application.add_handler(CommandHandler("start",       start))
+    application.add_handler(CommandHandler("stats",       group_stats))
     application.add_handler(CommandHandler("leaderboard", leaderboard))
-    application.add_handler(CommandHandler("mystats", my_stats))
-    application.add_handler(CommandHandler("grouprank", group_rank))
+    application.add_handler(CommandHandler("mystats",     my_stats))
+    application.add_handler(CommandHandler("grouprank",   group_rank))
     application.add_handler(CallbackQueryHandler(quiz_callback, pattern="view_stats"))
     application.add_handler(PollAnswerHandler(handle_poll_answer))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
-    application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
+    application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER,  group_remove_handler))
 
     await application.initialize()
     await application.start()

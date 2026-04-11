@@ -2,7 +2,6 @@ import os
 import logging
 import asyncio
 import random
-from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -34,6 +33,7 @@ app = Flask(__name__)
 scheduler = AsyncIOScheduler()
 active_quizzes = {}
 db_pool = None
+application = None
 
 # -------------------- Database Functions (asyncpg) --------------------
 async def init_db_pool():
@@ -255,11 +255,11 @@ async def generate_quiz():
         }
 
 # -------------------- Quiz Sender --------------------
-async def send_quiz_to_chat(chat_id, chat_title, context):
+async def send_quiz_to_chat(chat_id, chat_title, bot):
     try:
         if chat_id in active_quizzes:
             try:
-                await context.bot.delete_message(
+                await bot.delete_message(
                     chat_id=chat_id,
                     message_id=active_quizzes[chat_id]
                 )
@@ -295,7 +295,7 @@ async def send_quiz_to_chat(chat_id, chat_title, context):
             f"0% Ans 1 | 0% Ans 2 | 0% Ans 3 | 0% Ans 4"
         )
         
-        sent_msg = await context.bot.send_message(
+        sent_msg = await bot.send_message(
             chat_id=chat_id,
             text=message_text,
             reply_markup=reply_markup,
@@ -309,16 +309,16 @@ async def send_quiz_to_chat(chat_id, chat_title, context):
     except Exception as e:
         logger.error(f"Failed to send quiz to {chat_id}: {e}")
 
-async def send_quiz_to_all():
+async def send_quiz_to_all(bot):
     groups = await get_active_groups()
     for group in groups:
-        await send_quiz_to_chat(group['chat_id'], group['chat_title'], application)
+        await send_quiz_to_chat(group['chat_id'], group['chat_title'], bot)
 
 # -------------------- Auto-delete Helper --------------------
-async def delete_message_after_delay(context, chat_id, message_id, delay=30):
+async def delete_message_after_delay(bot, chat_id, message_id, delay=30):
     await asyncio.sleep(delay)
     try:
-        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
     except:
         pass
 
@@ -363,6 +363,7 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or "This group"
+    bot = context.bot
     
     total_participants, total_quizzes, total_answers = await get_group_stats(chat_id)
     
@@ -376,13 +377,14 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     if update.effective_chat.type != "private":
-        asyncio.create_task(delete_message_after_delay(context, chat_id, sent_msg.message_id, 30))
-        asyncio.create_task(delete_message_after_delay(context, chat_id, update.effective_message.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or "this group"
+    bot = context.bot
     
     stats = await get_user_stats(user.id, chat_id)
     
@@ -430,11 +432,12 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     
     if update.effective_chat.type != "private":
-        asyncio.create_task(delete_message_after_delay(context, chat_id, sent_msg.message_id, 30))
-        asyncio.create_task(delete_message_after_delay(context, chat_id, update.effective_message.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
+    bot = context.bot
     
     leaderboard_data = await get_leaderboard(chat_id)
     
@@ -457,8 +460,8 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_msg = await update.effective_message.reply_text(message, parse_mode='Markdown')
     
     if update.effective_chat.type != "private":
-        asyncio.create_task(delete_message_after_delay(context, chat_id, sent_msg.message_id, 30))
-        asyncio.create_task(delete_message_after_delay(context, chat_id, update.effective_message.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -555,7 +558,7 @@ async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"Let's have some fun learning together! 📚",
                 parse_mode='Markdown'
             )
-            await asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context))
+            await asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context.bot))
             break
 
 async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -564,22 +567,15 @@ async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     if chat_id in active_quizzes:
         del active_quizzes[chat_id]
 
-# -------------------- Application --------------------
-application = Application.builder().token(BOT_TOKEN).updater(None).build()
-
-# Register handlers
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("settings", settings))
-application.add_handler(CommandHandler("stats", group_stats))
-application.add_handler(CommandHandler("leaderboard", leaderboard))
-application.add_handler(CommandHandler("mystats", my_stats))
-application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|group_stats|leaderboard|close_settings|quiz_)"))
-application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
-application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
+# -------------------- Create Application --------------------
+def create_application():
+    """Create application without updater for webhook"""
+    return Application.builder().token(BOT_TOKEN).updater(None).build()
 
 # -------------------- Flask Webhook --------------------
 @app.route("/webhook", methods=["POST"])
 async def webhook():
+    global application
     data = request.get_json(force=True)
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
@@ -590,33 +586,46 @@ def index():
     return "Quiz Bot is running!"
 
 # -------------------- Main Entry --------------------
+async def main():
+    global application
+    
+    # Initialize database
+    await init_db_pool()
+    
+    # Create application
+    application = create_application()
+    
+    # Register handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("settings", settings))
+    application.add_handler(CommandHandler("stats", group_stats))
+    application.add_handler(CommandHandler("leaderboard", leaderboard))
+    application.add_handler(CommandHandler("mystats", my_stats))
+    application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|group_stats|leaderboard|close_settings|quiz_)"))
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
+    application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
+    
+    # Initialize application
+    await application.initialize()
+    await application.start()
+    
+    # Start scheduler
+    async def scheduled_quiz():
+        await send_quiz_to_all(application.bot)
+    
+    scheduler.add_job(scheduled_quiz, 'interval', minutes=30)
+    scheduler.start()
+    
+    # Set webhook
+    render_url = os.getenv("RENDER_EXTERNAL_URL")
+    if render_url:
+        webhook_url = f"{render_url}/webhook"
+        await application.bot.set_webhook(url=webhook_url)
+        logger.info(f"Webhook set to: {webhook_url}")
+    
+    # Start Flask
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    async def main():
-        # Initialize database
-        await init_db_pool()
-        
-        await application.initialize()
-        await application.start()
-        
-        # Start scheduler
-        scheduler.add_job(send_quiz_to_all, 'interval', minutes=30)
-        scheduler.start()
-        
-        render_url = os.getenv("RENDER_EXTERNAL_URL")
-        if render_url:
-            webhook_url = f"{render_url}/webhook"
-            await application.bot.set_webhook(url=webhook_url)
-            logger.info(f"Webhook set to: {webhook_url}")
-            
-            # Start Flask
-            port = int(os.environ.get("PORT", 5000))
-            app.run(host="0.0.0.0", port=port)
-        else:
-            # Polling for local testing
-            await application.updater.start_polling()
-            await asyncio.Event().wait()
-    
-    loop.run_until_complete(main())
+    asyncio.run(main())

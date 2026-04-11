@@ -2,7 +2,6 @@ import os
 import logging
 import asyncio
 import random
-import json
 from datetime import datetime
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -38,147 +37,182 @@ active_quizzes = {}
 
 # -------------------- Database Functions (psycopg2) --------------------
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL)
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 def init_db():
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS groups (
-                    chat_id BIGINT PRIMARY KEY,
-                    chat_title TEXT,
-                    added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active BOOLEAN DEFAULT TRUE,
-                    settings JSONB DEFAULT '{"quiz_interval": 30}'::jsonb
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS quiz_history (
-                    id SERIAL PRIMARY KEY,
-                    chat_id BIGINT,
-                    question TEXT,
-                    correct_answer TEXT,
-                    options TEXT[],
-                    asked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_scores (
-                    user_id BIGINT,
-                    chat_id BIGINT,
-                    username TEXT,
-                    first_name TEXT,
-                    correct_answers INTEGER DEFAULT 0,
-                    wrong_answers INTEGER DEFAULT 0,
-                    total_attempts INTEGER DEFAULT 0,
-                    PRIMARY KEY (user_id, chat_id)
-                )
-            """)
-            conn.commit()
-    logger.info("Database initialized")
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS groups (
+                        chat_id BIGINT PRIMARY KEY,
+                        chat_title TEXT,
+                        added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        is_active BOOLEAN DEFAULT TRUE
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS quiz_history (
+                        id SERIAL PRIMARY KEY,
+                        chat_id BIGINT,
+                        question TEXT,
+                        correct_answer TEXT,
+                        options TEXT[],
+                        asked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS user_scores (
+                        user_id BIGINT,
+                        chat_id BIGINT,
+                        username TEXT,
+                        first_name TEXT,
+                        correct_answers INTEGER DEFAULT 0,
+                        wrong_answers INTEGER DEFAULT 0,
+                        total_attempts INTEGER DEFAULT 0,
+                        PRIMARY KEY (user_id, chat_id)
+                    )
+                """)
+                conn.commit()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database init error: {e}")
+        raise
 
 def add_group(chat_id, chat_title):
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO groups (chat_id, chat_title) 
-                VALUES (%s, %s) 
-                ON CONFLICT (chat_id) DO UPDATE 
-                SET is_active = TRUE, chat_title = EXCLUDED.chat_title
-            """, (chat_id, chat_title))
-            conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO groups (chat_id, chat_title) 
+                    VALUES (%s, %s) 
+                    ON CONFLICT (chat_id) DO UPDATE 
+                    SET is_active = TRUE, chat_title = EXCLUDED.chat_title
+                """, (chat_id, chat_title))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Add group error: {e}")
 
 def remove_group(chat_id):
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE groups SET is_active = FALSE WHERE chat_id = %s", (chat_id,))
-            conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE groups SET is_active = FALSE WHERE chat_id = %s", (chat_id,))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Remove group error: {e}")
 
 def get_active_groups():
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("SELECT chat_id, chat_title FROM groups WHERE is_active = TRUE")
-            return cur.fetchall()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("SELECT chat_id, chat_title FROM groups WHERE is_active = TRUE")
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Get active groups error: {e}")
+        return []
 
 def save_quiz_history(chat_id, question, correct_answer, options):
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO quiz_history (chat_id, question, correct_answer, options)
-                VALUES (%s, %s, %s, %s)
-            """, (chat_id, question, correct_answer, options))
-            conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO quiz_history (chat_id, question, correct_answer, options)
+                    VALUES (%s, %s, %s, %s)
+                """, (chat_id, question, correct_answer, options))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Save quiz history error: {e}")
 
 def update_score(user_id, chat_id, username, first_name, is_correct):
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            if is_correct:
-                cur.execute("""
-                    INSERT INTO user_scores (user_id, chat_id, username, first_name, correct_answers, wrong_answers, total_attempts)
-                    VALUES (%s, %s, %s, %s, 1, 0, 1)
-                    ON CONFLICT (user_id, chat_id) DO UPDATE
-                    SET correct_answers = user_scores.correct_answers + 1,
-                        total_attempts = user_scores.total_attempts + 1,
-                        username = EXCLUDED.username,
-                        first_name = EXCLUDED.first_name
-                """, (user_id, chat_id, username, first_name))
-            else:
-                cur.execute("""
-                    INSERT INTO user_scores (user_id, chat_id, username, first_name, correct_answers, wrong_answers, total_attempts)
-                    VALUES (%s, %s, %s, %s, 0, 1, 1)
-                    ON CONFLICT (user_id, chat_id) DO UPDATE
-                    SET wrong_answers = user_scores.wrong_answers + 1,
-                        total_attempts = user_scores.total_attempts + 1,
-                        username = EXCLUDED.username,
-                        first_name = EXCLUDED.first_name
-                """, (user_id, chat_id, username, first_name))
-            conn.commit()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                if is_correct:
+                    cur.execute("""
+                        INSERT INTO user_scores (user_id, chat_id, username, first_name, correct_answers, wrong_answers, total_attempts)
+                        VALUES (%s, %s, %s, %s, 1, 0, 1)
+                        ON CONFLICT (user_id, chat_id) DO UPDATE
+                        SET correct_answers = user_scores.correct_answers + 1,
+                            total_attempts = user_scores.total_attempts + 1,
+                            username = EXCLUDED.username,
+                            first_name = EXCLUDED.first_name
+                    """, (user_id, chat_id, username, first_name))
+                else:
+                    cur.execute("""
+                        INSERT INTO user_scores (user_id, chat_id, username, first_name, correct_answers, wrong_answers, total_attempts)
+                        VALUES (%s, %s, %s, %s, 0, 1, 1)
+                        ON CONFLICT (user_id, chat_id) DO UPDATE
+                        SET wrong_answers = user_scores.wrong_answers + 1,
+                            total_attempts = user_scores.total_attempts + 1,
+                            username = EXCLUDED.username,
+                            first_name = EXCLUDED.first_name
+                    """, (user_id, chat_id, username, first_name))
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Update score error: {e}")
 
 def get_user_stats(user_id, chat_id):
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("""
-                SELECT correct_answers, wrong_answers, total_attempts
-                FROM user_scores
-                WHERE user_id = %s AND chat_id = %s
-            """, (user_id, chat_id))
-            return cur.fetchone()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("""
+                    SELECT correct_answers, wrong_answers, total_attempts
+                    FROM user_scores
+                    WHERE user_id = %s AND chat_id = %s
+                """, (user_id, chat_id))
+                return cur.fetchone()
+    except Exception as e:
+        logger.error(f"Get user stats error: {e}")
+        return None
 
 def get_group_stats(chat_id):
-    with get_db_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(DISTINCT user_id) FROM user_scores WHERE chat_id = %s", (chat_id,))
-            total_participants = cur.fetchone()[0]
-            cur.execute("SELECT COUNT(*) FROM quiz_history WHERE chat_id = %s", (chat_id,))
-            total_quizzes = cur.fetchone()[0]
-            cur.execute("SELECT COALESCE(SUM(total_attempts), 0) FROM user_scores WHERE chat_id = %s", (chat_id,))
-            total_answers = cur.fetchone()[0]
-            return total_participants, total_quizzes, total_answers
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(DISTINCT user_id) FROM user_scores WHERE chat_id = %s", (chat_id,))
+                total_participants = cur.fetchone()[0] or 0
+                cur.execute("SELECT COUNT(*) FROM quiz_history WHERE chat_id = %s", (chat_id,))
+                total_quizzes = cur.fetchone()[0] or 0
+                cur.execute("SELECT COALESCE(SUM(total_attempts), 0) FROM user_scores WHERE chat_id = %s", (chat_id,))
+                total_answers = cur.fetchone()[0] or 0
+                return total_participants, total_quizzes, total_answers
+    except Exception as e:
+        logger.error(f"Get group stats error: {e}")
+        return 0, 0, 0
 
 def get_leaderboard(chat_id, limit=10):
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("""
-                SELECT username, first_name, correct_answers, wrong_answers, total_attempts,
-                       ROUND(correct_answers * 100.0 / NULLIF(total_attempts, 0), 1) AS accuracy
-                FROM user_scores
-                WHERE chat_id = %s AND total_attempts > 0
-                ORDER BY correct_answers DESC, accuracy DESC
-                LIMIT %s
-            """, (chat_id, limit))
-            return cur.fetchall()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("""
+                    SELECT username, first_name, correct_answers, wrong_answers, total_attempts,
+                           ROUND(correct_answers * 100.0 / NULLIF(total_attempts, 0), 1) AS accuracy
+                    FROM user_scores
+                    WHERE chat_id = %s AND total_attempts > 0
+                    ORDER BY correct_answers DESC, accuracy DESC
+                    LIMIT %s
+                """, (chat_id, limit))
+                return cur.fetchall()
+    except Exception as e:
+        logger.error(f"Get leaderboard error: {e}")
+        return []
 
 def get_last_quiz(chat_id):
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            cur.execute("""
-                SELECT question, correct_answer, options 
-                FROM quiz_history 
-                WHERE chat_id = %s 
-                ORDER BY asked_at DESC 
-                LIMIT 1
-            """, (chat_id,))
-            return cur.fetchone()
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute("""
+                    SELECT question, correct_answer, options 
+                    FROM quiz_history 
+                    WHERE chat_id = %s 
+                    ORDER BY asked_at DESC 
+                    LIMIT 1
+                """, (chat_id,))
+                return cur.fetchone()
+    except Exception as e:
+        logger.error(f"Get last quiz error: {e}")
+        return None
 
 # -------------------- Gemini Quiz Generator --------------------
 async def generate_quiz():
@@ -198,17 +232,18 @@ async def generate_quiz():
     Make it interesting and educational. Difficulty: medium.
     """
     
-    async with aiohttp.ClientSession() as session:
-        async with session.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-            json={
-                "contents": [{
-                    "parts": [{"text": prompt}]
-                }]
-            }
-        ) as response:
-            data = await response.json()
-            try:
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+                json={
+                    "contents": [{
+                        "parts": [{"text": prompt}]
+                    }]
+                },
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as response:
+                data = await response.json()
                 text = data['candidates'][0]['content']['parts'][0]['text']
                 lines = text.strip().split('\n')
                 question = ""
@@ -233,14 +268,14 @@ async def generate_quiz():
                     'correct': answer if answer in ['A', 'B', 'C', 'D'] else 'A',
                     'category': category
                 }
-            except Exception as e:
-                logger.error(f"Gemini error: {e}")
-                return {
-                    'question': "What is the capital of France?",
-                    'options': ["London", "Berlin", "Paris", "Madrid"],
-                    'correct': 'C',
-                    'category': "Geography"
-                }
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return {
+            'question': "What is the capital of France?",
+            'options': ["London", "Berlin", "Paris", "Madrid"],
+            'correct': 'C',
+            'category': "Geography"
+        }
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz_to_chat(chat_id, chat_title, context):
@@ -313,11 +348,10 @@ async def delete_message_after_delay(context, chat_id, message_id, delay=30):
 # -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    bot_username = context.bot.username
     
     keyboard = [
-        [InlineKeyboardButton("➕ Add me to your chat", url=f"https://t.me/{context.bot.username}?startgroup=true")],
-        [InlineKeyboardButton("📢 Channel", url="https://t.me/sybotik")],
-        [InlineKeyboardButton("🆘 Support", url="https://t.me/sybotik_support")],
+        [InlineKeyboardButton("➕ Add me to your chat", url=f"https://t.me/{bot_username}?startgroup=true")],
         [InlineKeyboardButton("📊 View your stats", callback_data="view_stats")],
         [InlineKeyboardButton("🌐 Website", url="https://sybotik.com")]
     ]
@@ -336,7 +370,6 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_title = update.effective_chat.title or "This group"
     
     keyboard = [
-        [InlineKeyboardButton("⏱️ Set Quiz Interval", callback_data="set_interval")],
         [InlineKeyboardButton("📊 View Group Stats", callback_data="group_stats")],
         [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
         [InlineKeyboardButton("❌ Close", callback_data="close_settings")]
@@ -367,16 +400,16 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     
-    # Auto-delete after 30 seconds
-    asyncio.create_task(delete_message_after_delay(context, chat_id, sent_msg.message_id, 30))
+    if update.effective_chat.type != "private":
+        asyncio.create_task(delete_message_after_delay(context, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(context, chat_id, update.effective_message.message_id, 30))
 
-async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id=None, message=None):
+async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if not chat_id:
-        chat_id = update.effective_chat.id
+    chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or "this group"
     
     stats = get_user_stats(user.id, chat_id)
-    chat_title = update.effective_chat.title or "this group"
     
     if stats:
         correct = stats['correct_answers']
@@ -421,18 +454,16 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id=N
             parse_mode='Markdown'
         )
     
-    # Auto-delete after 30 seconds (only in groups, not in private chat)
     if update.effective_chat.type != "private":
         asyncio.create_task(delete_message_after_delay(context, chat_id, sent_msg.message_id, 30))
         asyncio.create_task(delete_message_after_delay(context, chat_id, update.effective_message.message_id, 30))
 
-async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id=None):
-    if not chat_id:
-        chat_id = update.effective_chat.id
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
     
-    leaderboard = get_leaderboard(chat_id)
+    leaderboard_data = get_leaderboard(chat_id)
     
-    if not leaderboard:
+    if not leaderboard_data:
         sent_msg = await update.effective_message.reply_text(
             "🏆 **Leaderboard**\n\n"
             "No scores yet! Be the first to answer a quiz! 🚀",
@@ -440,7 +471,7 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         )
     else:
         message = "🏆 **Leaderboard** 🏆\n\n"
-        for i, user in enumerate(leaderboard, 1):
+        for i, user in enumerate(leaderboard_data, 1):
             medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
             name = user['first_name'] or user['username'] or "Anonymous"
             accuracy = user['accuracy'] or 0
@@ -450,7 +481,6 @@ async def show_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE, c
         
         sent_msg = await update.effective_message.reply_text(message, parse_mode='Markdown')
     
-    # Auto-delete after 30 seconds (only in groups)
     if update.effective_chat.type != "private":
         asyncio.create_task(delete_message_after_delay(context, chat_id, sent_msg.message_id, 30))
         asyncio.create_task(delete_message_after_delay(context, chat_id, update.effective_message.message_id, 30))
@@ -480,7 +510,7 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # View stats from private chat
     if query.data == "view_stats":
-        await my_stats(update, context, chat_id)
+        await my_stats(update, context)
         return
     
     # Group stats callback
@@ -490,35 +520,12 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Leaderboard callback
     if query.data == "leaderboard":
-        await show_leaderboard(update, context, chat_id)
+        await leaderboard(update, context)
         return
     
     # Close settings
     if query.data == "close_settings":
         await query.edit_message_text("Settings closed. Use /settings to reopen.")
-        return
-    
-    # Set interval
-    if query.data == "set_interval":
-        keyboard = [
-            [InlineKeyboardButton("15 minutes", callback_data="interval_15")],
-            [InlineKeyboardButton("30 minutes", callback_data="interval_30")],
-            [InlineKeyboardButton("60 minutes", callback_data="interval_60")],
-            [InlineKeyboardButton("🔙 Back", callback_data="close_settings")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "⏱️ **Select Quiz Interval**\n\n"
-            "How often should I send quizzes in this group?",
-            reply_markup=reply_markup,
-            parse_mode='Markdown'
-        )
-        return
-    
-    # Handle interval selection
-    if query.data.startswith("interval_"):
-        interval = int(query.data.split("_")[1])
-        await query.edit_message_text(f"✅ Quiz interval set to {interval} minutes!")
         return
     
     # Handle quiz answer
@@ -589,16 +596,17 @@ application = Application.builder().token(BOT_TOKEN).updater(None).build()
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("settings", settings))
 application.add_handler(CommandHandler("stats", group_stats))
-application.add_handler(CommandHandler("leaderboard", show_leaderboard))
+application.add_handler(CommandHandler("leaderboard", leaderboard))
 application.add_handler(CommandHandler("mystats", my_stats))
-application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|group_stats|leaderboard|close_settings|set_interval|interval_|quiz_)"))
+application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|group_stats|leaderboard|close_settings|quiz_)"))
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
 application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
 
 # -------------------- Flask Webhook --------------------
 @app.route("/webhook", methods=["POST"])
 async def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
+    data = request.get_json(force=True)
+    update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return jsonify({"ok": True})
 
@@ -608,12 +616,18 @@ def index():
 
 # -------------------- Main Entry --------------------
 if __name__ == "__main__":
+    # Initialize database
     init_db()
+    
+    # Run the bot
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     
     async def main():
         await application.initialize()
         await application.start()
         
+        # Start scheduler
         scheduler.add_job(send_quiz_to_all, 'interval', minutes=30)
         scheduler.start()
         
@@ -622,12 +636,13 @@ if __name__ == "__main__":
             webhook_url = f"{render_url}/webhook"
             await application.bot.set_webhook(url=webhook_url)
             logger.info(f"Webhook set to: {webhook_url}")
+            
+            # Start Flask
             port = int(os.environ.get("PORT", 5000))
             app.run(host="0.0.0.0", port=port)
         else:
+            # Polling for local testing
             await application.updater.start_polling()
             await asyncio.Event().wait()
     
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     loop.run_until_complete(main())

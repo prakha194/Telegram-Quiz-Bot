@@ -4,6 +4,7 @@ import asyncio
 import random
 import threading
 import time
+import re
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Poll
 from telegram.ext import (
@@ -150,7 +151,7 @@ async def get_global_group_ranks():
 async def last_quiz(chat_id):
     return await db_pool.fetchrow("SELECT id, question, correct_answer, options FROM quiz_history WHERE chat_id = $1 ORDER BY asked_at DESC LIMIT 1", chat_id)
 
-# -------------------- Gemini (short quizzes) --------------------
+# -------------------- Gemini --------------------
 async def generate_quiz():
     categories = ["Brainstorming", "News", "GK", "Riddle", "Science", "Tech", "World News", "Telegram", "History", "Geography", "Sports"]
     cat = random.choice(categories)
@@ -191,9 +192,16 @@ async def delete_later(bot, chat_id, msg_id, delay=30):
         pass
 
 def escape_md(text):
-    """Escape MarkdownV2 special characters (including !)."""
-    special = r'_*[]()~`>#+-=|{}.!'
-    return ''.join(f'\\{c}' if c in special else c for c in str(text))
+    """Escape all MarkdownV2 special characters."""
+    special_chars = r'_*[]()~`>#+-=|{}.!'
+    return ''.join(f'\\{c}' if c in special_chars else c for c in str(text))
+
+def get_medal(i):
+    """Return medal emoji for top 3, plain text number for others."""
+    if i == 1: return "🥇"
+    if i == 2: return "🥈"
+    if i == 3: return "🥉"
+    return f"{i}."
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz(chat_id, title, bot):
@@ -239,6 +247,7 @@ async def handle_poll_answer(update, context):
 
 # -------------------- Command Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info(f"Start command from {update.effective_chat.id} type={update.effective_chat.type}")
     if update.effective_chat.type == "private":
         kb = [[InlineKeyboardButton("➕ Add me to a group", url=f"https://t.me/{context.bot.username}?startgroup=true")],
               [InlineKeyboardButton("📊 My Global Stats", callback_data="my_stats")]]
@@ -282,29 +291,33 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = "🌍 *Global Group Ranks*\n"
     my_rank = None
     for i, row in enumerate(global_ranks, 1):
-        gtitle = row['chat_title'] or f"Group {row['chat_id']}"
-        medal = "🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else f"{i}\\."
-        out += f"{medal} {escape_md(gtitle)}: {row['total_correct']} ✅\n"
+        gtitle = escape_md(row['chat_title'] or f"Group {row['chat_id']}")
+        medal = get_medal(i)
+        out += f"{medal} {gtitle}: {row['total_correct']} ✅\n"
         if row['chat_id'] == cid:
             my_rank = i
     if my_rank:
-        out += f"\n📌 *{escape_md(title)}* is #{my_rank} globally.\n"
+        out += f"\n📌 *{escape_md(title)}* is \\#{my_rank} globally\\.\n"
 
     # Top 5 members in this group
     members = await get_top_members(cid, 5)
     if members:
         out += "\n👥 *Top 5 Members*\n"
         for i, m in enumerate(members, 1):
-            medal = "🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else f"{i}\\."
+            medal = get_medal(i)
             name = escape_md(m['first_name'] or "Anonymous")
             acc = m['acc'] or 0
-            out += f"{medal} {name}: {m['correct_answers']}✅ / {m['wrong_answers']}❌ ({acc}%)\n"
+            out += f"{medal} {name}: {m['correct_answers']}✅ / {m['wrong_answers']}❌ \\({acc}%\\)\n"
     else:
-        out += "\n👥 No members have answered yet."
+        out += "\n👥 No members have answered yet\\."
 
-    msg = await update.effective_message.reply_text(out, parse_mode='MarkdownV2')
-    asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 60))
-    asyncio.create_task(delete_later(context.bot, cid, update.effective_message.message_id, 60))
+    try:
+        msg = await update.effective_message.reply_text(out, parse_mode='MarkdownV2')
+        asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 60))
+        asyncio.create_task(delete_later(context.bot, cid, update.effective_message.message_id, 60))
+    except Exception as e:
+        logger.error(f"Leaderboard send error: {e}\nText was:\n{out}")
+        await update.effective_message.reply_text("⚠️ Error displaying leaderboard. Try again.")
 
 async def my_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -317,11 +330,31 @@ async def my_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         total = stats['total']
         acc = round(correct * 100.0 / total, 1)
         rank = await get_global_rank(user.id)
-        medal = "🥇" if rank==1 else "🥈" if rank==2 else "🥉" if rank==3 else f"#{rank}"
-        text = f"📊 *Your Global Stats*\n\n👤 {escape_md(user.first_name)}\n✅ Correct: {correct}\n❌ Wrong: {wrong}\n📊 Attempts: {total}\n🎯 Accuracy: {acc}%\n🏆 Global Rank: {medal}"
+        medal = get_medal(rank)
+        text = (
+            f"📊 *Your Global Stats*\n\n"
+            f"👤 {escape_md(user.first_name)}\n"
+            f"✅ Correct: {correct}\n"
+            f"❌ Wrong: {wrong}\n"
+            f"📊 Attempts: {total}\n"
+            f"🎯 Accuracy: {acc}%\n"
+            f"🏆 Global Rank: {escape_md(str(medal))}"
+        )
     else:
-        text = f"📊 *Your Global Stats*\n\n👤 {escape_md(user.first_name)}\nNo quizzes answered yet\\. Join a group where I am added and answer\\!"
-    await query.message.reply_text(text, parse_mode='MarkdownV2')
+        text = (
+            f"📊 *Your Global Stats*\n\n"
+            f"👤 {escape_md(user.first_name)}\n"
+            f"No quizzes answered yet\\. Join a group and answer\\!"
+        )
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=text,
+            parse_mode='MarkdownV2'
+        )
+    except Exception as e:
+        logger.error(f"Stats callback error: {e}")
+        await query.answer("⚠️ Could not send stats. Start the bot in private first.", show_alert=True)
 
 async def group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for member in update.message.new_chat_members:

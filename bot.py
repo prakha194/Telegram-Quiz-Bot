@@ -35,8 +35,9 @@ scheduler = AsyncIOScheduler()
 active_quizzes = {}
 db_pool = None
 application = None
+quiz_sent_flag = {}  # Track if quiz sent for each group
 
-# -------------------- Database Functions (asyncpg) --------------------
+# -------------------- Database Functions --------------------
 async def init_db_pool():
     global db_pool
     try:
@@ -140,7 +141,7 @@ async def update_score(user_id, chat_id, username, first_name, is_correct):
                         username = EXCLUDED.username,
                         first_name = EXCLUDED.first_name
                 """, user_id, chat_id, username, first_name)
-            logger.info(f"Score updated for user {user_id} in chat {chat_id}: {'correct' if is_correct else 'wrong'}")
+            logger.info(f"Score updated - User: {user_id}, Chat: {chat_id}, Correct: {is_correct}")
     except Exception as e:
         logger.error(f"Update score error: {e}")
 
@@ -268,15 +269,6 @@ async def delete_message_after_delay(bot, chat_id, message_id, delay=30):
     except Exception as e:
         logger.error(f"Failed to delete message: {e}")
 
-async def delete_bot_message_after_delay(bot, chat_id, message_id, delay=30):
-    """Delete bot's own message (quiz) after delay"""
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-        logger.info(f"Deleted bot quiz message {message_id} in chat {chat_id}")
-    except Exception as e:
-        logger.error(f"Failed to delete bot message: {e}")
-
 # -------------------- Quiz Sender --------------------
 async def send_quiz_to_chat(chat_id, chat_title, bot):
     try:
@@ -294,13 +286,13 @@ async def send_quiz_to_chat(chat_id, chat_title, bot):
         
         keyboard = [
             [
-                InlineKeyboardButton("📊 Show Results", callback_data=f"show_results_{chat_id}")
-            ],
-            [
                 InlineKeyboardButton("🔴 A", callback_data=f"quiz_{chat_id}_A"),
                 InlineKeyboardButton("🔵 B", callback_data=f"quiz_{chat_id}_B"),
                 InlineKeyboardButton("🟢 C", callback_data=f"quiz_{chat_id}_C"),
                 InlineKeyboardButton("🟡 D", callback_data=f"quiz_{chat_id}_D")
+            ],
+            [
+                InlineKeyboardButton("📊 Show Results", callback_data=f"show_results_{chat_id}")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -332,62 +324,45 @@ async def send_quiz_to_chat(chat_id, chat_title, bot):
         logger.info(f"Quiz sent to {chat_title} ({chat_id})")
         
         # Auto-delete bot's quiz message after 5 minutes (300 seconds)
-        asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 300))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 300))
         
     except Exception as e:
         logger.error(f"Failed to send quiz to {chat_id}: {e}")
 
-async def send_quiz_to_all(bot):
+async def send_quiz_to_all():
+    """Send quiz to all active groups - this runs every 5 minutes"""
     groups = await get_active_groups()
     logger.info(f"Sending quizzes to {len(groups)} active groups")
     for group in groups:
-        await send_quiz_to_chat(group['chat_id'], group['chat_title'], bot)
+        chat_id = group['chat_id']
+        chat_title = group['chat_title']
+        await send_quiz_to_chat(chat_id, chat_title, application.bot)
 
 # -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    bot_username = context.bot.username
+    chat_type = update.effective_chat.type
     
     keyboard = [
-        [InlineKeyboardButton("➕ Add me to your chat", url=f"https://t.me/{bot_username}?startgroup=true")],
         [InlineKeyboardButton("📊 View your stats", callback_data="view_stats")]
     ]
+    
+    # Only show "Add to chat" button in private chat
+    if chat_type == "private":
+        keyboard.insert(0, [InlineKeyboardButton("➕ Add me to your chat", url=f"https://t.me/{context.bot.username}?startgroup=true")])
+    
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     sent_msg = await update.message.reply_text(
         f"Hey there! My name is **Albert**. I am a multi-language quiz bot that sends random quizzes in groups.\n\n"
-        f"Send the /settings command in groups to configure me.\n\n"
         f"*Powered by Sybotik.*",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
     
-    # Auto-delete bot's welcome message after 30 seconds
-    asyncio.create_task(delete_bot_message_after_delay(context.bot, update.effective_chat.id, sent_msg.message_id, 30))
-
-async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_title = update.effective_chat.title or "This group"
-    
-    keyboard = [
-        [InlineKeyboardButton("📊 View Group Stats", callback_data="group_stats")],
-        [InlineKeyboardButton("🏆 Leaderboard", callback_data="leaderboard")],
-        [InlineKeyboardButton("❌ Close", callback_data="close_settings")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    sent_msg = await update.message.reply_text(
-        f"⚙️ **Settings for {chat_title}**\n\n"
-        f"Configure how Albert behaves in this chat.\n\n"
-        f"Current settings:\n"
-        f"• Quiz interval: 5 minutes\n"
-        f"• Quiz auto-delete: 5 minutes",
-        reply_markup=reply_markup,
-        parse_mode='Markdown'
-    )
-    
-    # Auto-delete settings message after 30 seconds
-    asyncio.create_task(delete_bot_message_after_delay(context.bot, update.effective_chat.id, sent_msg.message_id, 30))
-    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, update.effective_message.message_id, 30))
+    # Auto-delete bot's welcome message after 30 seconds (only in groups)
+    if chat_type != "private":
+        asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, sent_msg.message_id, 30))
 
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -405,9 +380,8 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
     
-    if update.effective_chat.type != "private":
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
+    asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+    asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -442,8 +416,7 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"❌ Wrong answers: {wrong}\n"
             f"📊 Total attempts: {total}\n"
             f"🎯 Accuracy: {accuracy}%\n\n"
-            f"💬 {motivation}\n\n"
-            f"Keep participating! You can do better! 💪",
+            f"💬 {motivation}",
             parse_mode='Markdown'
         )
     else:
@@ -460,9 +433,8 @@ async def my_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     
-    if update.effective_chat.type != "private":
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
+    asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+    asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -488,9 +460,8 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         sent_msg = await update.effective_message.reply_text(message, parse_mode='Markdown')
     
-    if update.effective_chat.type != "private":
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
-        asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
+    asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+    asyncio.create_task(delete_message_after_delay(bot, chat_id, update.effective_message.message_id, 30))
 
 async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -512,31 +483,17 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 result_text += f"✅ {letter}: {opt}\n"
             result_text += f"\n🔑 Correct answer: {quiz['correct_answer']}"
             sent_msg = await query.edit_message_text(result_text, parse_mode='Markdown')
-            asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+            asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         else:
             sent_msg = await query.edit_message_text("No quiz results available yet!")
-            asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+            asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         return
     
     # View stats from private chat
     if query.data == "view_stats":
+        # Create a fake message object for stats
+        update.effective_message = query.message
         await my_stats(update, context)
-        return
-    
-    # Group stats callback
-    if query.data == "group_stats":
-        await group_stats(update, context)
-        return
-    
-    # Leaderboard callback
-    if query.data == "leaderboard":
-        await leaderboard(update, context)
-        return
-    
-    # Close settings
-    if query.data == "close_settings":
-        sent_msg = await query.edit_message_text("Settings closed. Use /settings to reopen.")
-        asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         return
     
     # Handle quiz answer
@@ -547,7 +504,7 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         if not quiz:
             sent_msg = await query.edit_message_text("Quiz expired! Waiting for next quiz...")
-            asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+            asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
             return
         
         correct = quiz['correct_answer']
@@ -573,7 +530,7 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text += f"\n🔑 Correct answer was: {correct}"
         
         sent_msg = await query.edit_message_text(result_text, parse_mode='Markdown')
-        asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         
         if chat_id in active_quizzes:
             del active_quizzes[chat_id]
@@ -587,14 +544,14 @@ async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             sent_msg = await update.message.reply_text(
                 f"✅ Hey everyone! I'm **Albert**! 🎉\n\n"
                 f"I'll send random quizzes every 5 minutes!\n\n"
-                f"Use /settings to configure me.\n"
                 f"Use /stats to see group statistics.\n"
                 f"Use /leaderboard to see top scorers.\n\n"
                 f"Let's have some fun learning together! 📚",
                 parse_mode='Markdown'
             )
-            asyncio.create_task(delete_bot_message_after_delay(context.bot, chat_id, sent_msg.message_id, 30))
-            asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context.bot))
+            asyncio.create_task(delete_message_after_delay(context.bot, chat_id, sent_msg.message_id, 30))
+            # Send first quiz immediately
+            await asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context.bot))
             break
 
 async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -613,12 +570,8 @@ def webhook():
     global application
     try:
         data = request.get_json(force=True)
-        print("Update received:", data)
-        
         update = Update.de_json(data, application.bot)
-        
         asyncio.run(application.process_update(update))
-        
         return jsonify({"ok": True})
     except Exception as e:
         print("Webhook error:", e)
@@ -636,12 +589,12 @@ async def main():
     
     application = create_application()
     
+    # Register handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CommandHandler("stats", group_stats))
     application.add_handler(CommandHandler("leaderboard", leaderboard))
     application.add_handler(CommandHandler("mystats", my_stats))
-    application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|group_stats|leaderboard|close_settings|quiz_)"))
+    application.add_handler(CallbackQueryHandler(quiz_callback, pattern="^(show_results_|view_stats|quiz_)"))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
     application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
     
@@ -651,10 +604,7 @@ async def main():
     logger.info("Application initialized and started")
     
     # Start scheduler - Quiz every 5 MINUTES
-    async def scheduled_quiz():
-        await send_quiz_to_all(application.bot)
-    
-    scheduler.add_job(scheduled_quiz, 'interval', minutes=5)
+    scheduler.add_job(send_quiz_to_all, 'interval', minutes=5)
     scheduler.start()
     logger.info("Scheduler started - quizzes every 5 minutes")
     

@@ -186,7 +186,7 @@ QUESTION: (max 15 words)
 OPTIONS: A) ... | B) ... | C) ... | D) ...
 ANSWER: A, B, C or D
 Make it fun and concise."""
-    for _ in range(3):
+    for attempt in range(3):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
@@ -195,20 +195,44 @@ Make it fun and concise."""
                     timeout=30
                 ) as resp:
                     data = await resp.json()
-                    text = data['candidates'][0]['content']['parts'][0]['text']
+                    logger.info(f"Gemini raw response: {data}")  # See exactly what's returned
+
+                    # Handle blocked/error responses
+                    if 'candidates' not in data:
+                        reason = data.get('promptFeedback', {}).get('blockReason') or data.get('error', {}).get('message') or str(data)
+                        logger.error(f"Gemini no candidates (attempt {attempt+1}): {reason}")
+                        await asyncio.sleep(2)
+                        continue
+
+                    candidate = data['candidates'][0]
+
+                    # Handle safety-blocked candidates
+                    if candidate.get('finishReason') not in ('STOP', None, 'MAX_TOKENS'):
+                        logger.error(f"Gemini bad finishReason: {candidate.get('finishReason')}")
+                        await asyncio.sleep(2)
+                        continue
+
+                    text = candidate['content']['parts'][0]['text']
                     q, opts, ans = "", [], ""
                     for line in text.split('\n'):
+                        line = line.strip()
                         if line.startswith("QUESTION:"):
                             q = line.replace("QUESTION:", "").strip()
                         elif line.startswith("OPTIONS:"):
                             opts = [o.strip() for o in line.replace("OPTIONS:", "").strip().split("|")]
                         elif line.startswith("ANSWER:"):
                             ans = line.replace("ANSWER:", "").strip().upper()
+                            if ans and ans[0] in 'ABCD':
+                                ans = ans[0]  # Take just the letter in case of "A)" or "A."
+
                     if q and len(opts) == 4 and ans in 'ABCD':
                         return {'question': q, 'options': opts, 'correct_letter': ans, 'correct_index': ord(ans) - 65}
+                    else:
+                        logger.error(f"Gemini bad parse — q={q!r} opts={opts} ans={ans!r}\nRaw:\n{text}")
+
         except Exception as e:
-            logger.error(f"Gemini error: {e}")
-        await asyncio.sleep(1)
+            logger.error(f"Gemini exception (attempt {attempt+1}): {e}")
+        await asyncio.sleep(2)
     raise Exception("Gemini failed after 3 attempts")
 
 # -------------------- Helpers --------------------

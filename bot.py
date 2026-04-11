@@ -34,6 +34,7 @@ scheduler = AsyncIOScheduler()
 active_quizzes = {}
 db_pool = None
 application = None
+bot_loop = None
 
 # -------------------- Database Functions (asyncpg) --------------------
 async def init_db_pool():
@@ -569,17 +570,28 @@ async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # -------------------- Create Application --------------------
 def create_application():
-    """Create application without updater for webhook"""
     return Application.builder().token(BOT_TOKEN).updater(None).build()
 
-# -------------------- Flask Webhook --------------------
+# -------------------- Flask Webhook (SYNC - no async) --------------------
 @app.route("/webhook", methods=["POST"])
-async def webhook():
-    global application
-    data = request.get_json(force=True)
-    update = Update.de_json(data, application.bot)
-    await application.process_update(update)
-    return jsonify({"ok": True})
+def webhook():
+    """Synchronous webhook handler - receives updates from Telegram"""
+    global application, bot_loop
+    
+    try:
+        data = request.get_json(force=True)
+        update = Update.de_json(data, application.bot)
+        
+        # Schedule the update processing in the asyncio event loop
+        asyncio.run_coroutine_threadsafe(
+            application.process_update(update),
+            bot_loop
+        )
+        
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.error(f"Webhook error: {e}")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
 def index():
@@ -587,7 +599,9 @@ def index():
 
 # -------------------- Main Entry --------------------
 async def main():
-    global application
+    global application, bot_loop
+    
+    bot_loop = asyncio.get_running_loop()
     
     # Initialize database
     await init_db_pool()
@@ -608,6 +622,7 @@ async def main():
     # Initialize application
     await application.initialize()
     await application.start()
+    logger.info("Application initialized and started")
     
     # Start scheduler
     async def scheduled_quiz():
@@ -615,17 +630,32 @@ async def main():
     
     scheduler.add_job(scheduled_quiz, 'interval', minutes=30)
     scheduler.start()
+    logger.info("Scheduler started - quizzes every 30 minutes")
     
     # Set webhook
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:
         webhook_url = f"{render_url}/webhook"
-        await application.bot.set_webhook(url=webhook_url)
-        logger.info(f"Webhook set to: {webhook_url}")
-    
-    # Start Flask
+        result = await application.bot.set_webhook(url=webhook_url)
+        if result:
+            logger.info(f"Webhook set successfully to: {webhook_url}")
+        else:
+            logger.error(f"Failed to set webhook to: {webhook_url}")
+    else:
+        logger.warning("RENDER_EXTERNAL_URL not found, webhook not set")
+
+def start_flask():
+    """Start Flask in a separate thread"""
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Create event loop for async operations
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Run main async setup
+    loop.run_until_complete(main())
+    
+    # Start Flask in the main thread (it blocks)
+    start_flask()

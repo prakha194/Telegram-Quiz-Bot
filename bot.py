@@ -40,7 +40,7 @@ application = None
 async def init_db_pool():
     global db_pool
     try:
-        db_pool = await asyncpg.create_pool(DATABASE_URL)
+        db_pool = await asyncpg.create_pool(DATABASE_URL, command_timeout=60)
         async with db_pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS groups (
@@ -86,6 +86,7 @@ async def add_group(chat_id, chat_title):
                 ON CONFLICT (chat_id) DO UPDATE 
                 SET is_active = TRUE, chat_title = EXCLUDED.chat_title
             """, chat_id, chat_title)
+            logger.info(f"Group added: {chat_title} ({chat_id})")
     except Exception as e:
         logger.error(f"Add group error: {e}")
 
@@ -93,6 +94,7 @@ async def remove_group(chat_id):
     try:
         async with db_pool.acquire() as conn:
             await conn.execute("UPDATE groups SET is_active = FALSE WHERE chat_id = $1", chat_id)
+            logger.info(f"Group removed: {chat_id}")
     except Exception as e:
         logger.error(f"Remove group error: {e}")
 
@@ -111,6 +113,7 @@ async def save_quiz_history(chat_id, question, correct_answer, options):
                 INSERT INTO quiz_history (chat_id, question, correct_answer, options)
                 VALUES ($1, $2, $3, $4)
             """, chat_id, question, correct_answer, options)
+            logger.info(f"Quiz saved for chat: {chat_id}")
     except Exception as e:
         logger.error(f"Save quiz history error: {e}")
 
@@ -137,6 +140,7 @@ async def update_score(user_id, chat_id, username, first_name, is_correct):
                         username = EXCLUDED.username,
                         first_name = EXCLUDED.first_name
                 """, user_id, chat_id, username, first_name)
+            logger.info(f"Score updated for user {user_id} in chat {chat_id}: {'correct' if is_correct else 'wrong'}")
     except Exception as e:
         logger.error(f"Update score error: {e}")
 
@@ -255,9 +259,28 @@ async def generate_quiz():
             'category': "Geography"
         }
 
+# -------------------- Auto-delete Helper --------------------
+async def delete_message_after_delay(bot, chat_id, message_id, delay=30):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Deleted message {message_id} in chat {chat_id}")
+    except Exception as e:
+        logger.error(f"Failed to delete message: {e}")
+
+async def delete_bot_message_after_delay(bot, chat_id, message_id, delay=30):
+    """Delete bot's own message (quiz) after delay"""
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        logger.info(f"Deleted bot quiz message {message_id} in chat {chat_id}")
+    except Exception as e:
+        logger.error(f"Failed to delete bot message: {e}")
+
 # -------------------- Quiz Sender --------------------
 async def send_quiz_to_chat(chat_id, chat_title, bot):
     try:
+        # Delete previous quiz if exists
         if chat_id in active_quizzes:
             try:
                 await bot.delete_message(
@@ -293,7 +316,8 @@ async def send_quiz_to_chat(chat_id, chat_title, bot):
             f"{quiz['question']}\n\n"
             f"*Anonymous Quiz*\n\n"
             f"{options_text}\n"
-            f"0% Ans 1 | 0% Ans 2 | 0% Ans 3 | 0% Ans 4"
+            f"0% Ans 1 | 0% Ans 2 | 0% Ans 3 | 0% Ans 4\n\n"
+            f"⏰ This quiz will auto-delete in 5 minutes!"
         )
         
         sent_msg = await bot.send_message(
@@ -307,21 +331,17 @@ async def send_quiz_to_chat(chat_id, chat_title, bot):
         await save_quiz_history(chat_id, quiz['question'], quiz['correct'], quiz['options'])
         logger.info(f"Quiz sent to {chat_title} ({chat_id})")
         
+        # Auto-delete bot's quiz message after 5 minutes (300 seconds)
+        asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 300))
+        
     except Exception as e:
         logger.error(f"Failed to send quiz to {chat_id}: {e}")
 
 async def send_quiz_to_all(bot):
     groups = await get_active_groups()
+    logger.info(f"Sending quizzes to {len(groups)} active groups")
     for group in groups:
         await send_quiz_to_chat(group['chat_id'], group['chat_title'], bot)
-
-# -------------------- Auto-delete Helper --------------------
-async def delete_message_after_delay(bot, chat_id, message_id, delay=30):
-    await asyncio.sleep(delay)
-    try:
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except:
-        pass
 
 # -------------------- Handlers --------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -334,13 +354,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         f"Hey there! My name is **Albert**. I am a multi-language quiz bot that sends random quizzes in groups.\n\n"
         f"Send the /settings command in groups to configure me.\n\n"
         f"*Powered by Sybotik.*",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
+    
+    # Auto-delete bot's welcome message after 30 seconds
+    asyncio.create_task(delete_bot_message_after_delay(context.bot, update.effective_chat.id, sent_msg.message_id, 30))
 
 async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_title = update.effective_chat.title or "This group"
@@ -352,14 +375,19 @@ async def settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(
+    sent_msg = await update.message.reply_text(
         f"⚙️ **Settings for {chat_title}**\n\n"
         f"Configure how Albert behaves in this chat.\n\n"
         f"Current settings:\n"
-        f"• Quiz interval: 30 minutes",
+        f"• Quiz interval: 5 minutes\n"
+        f"• Quiz auto-delete: 5 minutes",
         reply_markup=reply_markup,
         parse_mode='Markdown'
     )
+    
+    # Auto-delete settings message after 30 seconds
+    asyncio.create_task(delete_bot_message_after_delay(context.bot, update.effective_chat.id, sent_msg.message_id, 30))
+    asyncio.create_task(delete_message_after_delay(context.bot, update.effective_chat.id, update.effective_message.message_id, 30))
 
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -470,6 +498,7 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     user = update.effective_user
     chat_id = update.effective_chat.id
+    bot = context.bot
     
     # Show results button
     if query.data.startswith("show_results_"):
@@ -482,9 +511,11 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 letter = ['A', 'B', 'C', 'D'][i]
                 result_text += f"✅ {letter}: {opt}\n"
             result_text += f"\n🔑 Correct answer: {quiz['correct_answer']}"
-            await query.edit_message_text(result_text, parse_mode='Markdown')
+            sent_msg = await query.edit_message_text(result_text, parse_mode='Markdown')
+            asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         else:
-            await query.edit_message_text("No quiz results available yet!")
+            sent_msg = await query.edit_message_text("No quiz results available yet!")
+            asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         return
     
     # View stats from private chat
@@ -504,7 +535,8 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Close settings
     if query.data == "close_settings":
-        await query.edit_message_text("Settings closed. Use /settings to reopen.")
+        sent_msg = await query.edit_message_text("Settings closed. Use /settings to reopen.")
+        asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         return
     
     # Handle quiz answer
@@ -514,7 +546,8 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         quiz = await get_last_quiz(chat_id)
         
         if not quiz:
-            await query.edit_message_text("Quiz expired! Waiting for next quiz...")
+            sent_msg = await query.edit_message_text("Quiz expired! Waiting for next quiz...")
+            asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
             return
         
         correct = quiz['correct_answer']
@@ -539,7 +572,8 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result_text += f"\n{'🎉 Correct answer!' if is_correct else '😢 Wrong answer!'}"
         result_text += f"\n🔑 Correct answer was: {correct}"
         
-        await query.edit_message_text(result_text, parse_mode='Markdown')
+        sent_msg = await query.edit_message_text(result_text, parse_mode='Markdown')
+        asyncio.create_task(delete_bot_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         
         if chat_id in active_quizzes:
             del active_quizzes[chat_id]
@@ -550,16 +584,17 @@ async def group_add_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_id = update.effective_chat.id
             chat_title = update.effective_chat.title or "Group"
             await add_group(chat_id, chat_title)
-            await update.message.reply_text(
+            sent_msg = await update.message.reply_text(
                 f"✅ Hey everyone! I'm **Albert**! 🎉\n\n"
-                f"I'll send random quizzes every 30 minutes!\n\n"
+                f"I'll send random quizzes every 5 minutes!\n\n"
                 f"Use /settings to configure me.\n"
                 f"Use /stats to see group statistics.\n"
                 f"Use /leaderboard to see top scorers.\n\n"
                 f"Let's have some fun learning together! 📚",
                 parse_mode='Markdown'
             )
-            await asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context.bot))
+            asyncio.create_task(delete_bot_message_after_delay(context.bot, chat_id, sent_msg.message_id, 30))
+            asyncio.create_task(send_quiz_to_chat(chat_id, chat_title, context.bot))
             break
 
 async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -572,17 +607,16 @@ async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 def create_application():
     return Application.builder().token(BOT_TOKEN).build()
 
-# -------------------- Flask Webhook (SYNC - CRITICAL FIX) --------------------
+# -------------------- Flask Webhook --------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global application
     try:
         data = request.get_json(force=True)
-        print("Update received:", data)  # DEBUG
+        print("Update received:", data)
         
         update = Update.de_json(data, application.bot)
         
-        # Run the async update processing
         asyncio.run(application.process_update(update))
         
         return jsonify({"ok": True})
@@ -598,13 +632,10 @@ def index():
 async def main():
     global application
     
-    # Initialize database
     await init_db_pool()
     
-    # Create application
     application = create_application()
     
-    # Register handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("settings", settings))
     application.add_handler(CommandHandler("stats", group_stats))
@@ -614,21 +645,20 @@ async def main():
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add_handler))
     application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_remove_handler))
     
-    # Initialize application
     await application.initialize()
     await application.start()
-    await application.bot.initialize()  # CRITICAL FIX
+    await application.bot.initialize()
     logger.info("Application initialized and started")
     
-    # Start scheduler
+    # Start scheduler - Quiz every 5 MINUTES
     async def scheduled_quiz():
         await send_quiz_to_all(application.bot)
     
-    scheduler.add_job(scheduled_quiz, 'interval', minutes=30)
+    scheduler.add_job(scheduled_quiz, 'interval', minutes=5)
     scheduler.start()
-    logger.info("Scheduler started - quizzes every 30 minutes")
+    logger.info("Scheduler started - quizzes every 5 minutes")
     
-    # Set webhook (MANDATORY)
+    # Set webhook
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if not render_url:
         raise Exception("RENDER_EXTERNAL_URL not set")
@@ -643,15 +673,12 @@ def run_flask():
     app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # Run async main setup
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(main())
     
-    # Start Flask in a separate thread (fixes blocking)
     threading.Thread(target=run_flask).start()
     
-    # Keep the main thread alive
     try:
         loop.run_forever()
     except KeyboardInterrupt:

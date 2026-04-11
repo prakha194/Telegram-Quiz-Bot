@@ -533,12 +533,56 @@ async def quiz_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         return
     
-    # View stats from private chat
+    # View stats from private chat - FIXED: Don't modify update directly
     if query.data == "view_stats":
         await query.answer()
-        # Create a fake message object for stats
-        update.effective_message = query.message
-        await my_stats(update, context)
+        # Get user stats and send as a new message
+        stats = await get_user_stats(user.id, chat_id)
+        chat_title = update.effective_chat.title or "this group"
+        
+        if stats:
+            correct = stats['correct_answers']
+            wrong = stats['wrong_answers']
+            total = stats['total_attempts']
+            accuracy = round((correct * 100.0 / total), 1) if total > 0 else 0
+            
+            if accuracy >= 80:
+                motivation = "🌟 Excellent! You're a quiz master! Keep shining!"
+            elif accuracy >= 60:
+                motivation = "🎉 Great job! You're doing really well!"
+            elif accuracy >= 40:
+                motivation = "👍 Good effort! Practice makes perfect!"
+            elif accuracy >= 20:
+                motivation = "💪 Keep going! Every quiz makes you smarter!"
+            else:
+                motivation = "🌱 You're just getting started! Try more quizzes to improve!"
+            
+            sent_msg = await query.message.reply_text(
+                f"📊 **Your Stats in {chat_title}**\n\n"
+                f"👤 Name: {user.first_name}\n"
+                f"🆔 ID: {user.id}\n\n"
+                f"✅ Correct answers: {correct}\n"
+                f"❌ Wrong answers: {wrong}\n"
+                f"📊 Total attempts: {total}\n"
+                f"🎯 Accuracy: {accuracy}%\n\n"
+                f"💬 {motivation}",
+                parse_mode='Markdown'
+            )
+        else:
+            sent_msg = await query.message.reply_text(
+                f"📊 **Your Stats in {chat_title}**\n\n"
+                f"👤 Name: {user.first_name}\n"
+                f"🆔 ID: {user.id}\n\n"
+                f"✅ Correct answers: 0\n"
+                f"❌ Wrong answers: 0\n"
+                f"📊 Total attempts: 0\n"
+                f"🎯 Accuracy: 0%\n\n"
+                f"🌱 You haven't participated in any quiz yet!\n"
+                f"💬 Answer the next quiz to get started! 🚀",
+                parse_mode='Markdown'
+            )
+        
+        asyncio.create_task(delete_message_after_delay(bot, chat_id, sent_msg.message_id, 30))
         return
     
     # Handle quiz answer

@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 import random
+import threading
 from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -34,7 +35,6 @@ scheduler = AsyncIOScheduler()
 active_quizzes = {}
 db_pool = None
 application = None
-bot_loop = None
 
 # -------------------- Database Functions (asyncpg) --------------------
 async def init_db_pool():
@@ -570,30 +570,24 @@ async def group_remove_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # -------------------- Create Application --------------------
 def create_application():
-    return Application.builder().token(BOT_TOKEN).updater(None).build()
+    return Application.builder().token(BOT_TOKEN).build()
 
-# -------------------- Flask Webhook (SYNC - no async) --------------------
+# -------------------- Flask Webhook (SYNC - CRITICAL FIX) --------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global application
-
     try:
-        if application is None:
-            print("Application not ready")
-            return jsonify({"error": "app not ready"}), 500
-
         data = request.get_json(force=True)
-        print("Incoming update:", data)
-
+        print("Update received:", data)  # DEBUG
+        
         update = Update.de_json(data, application.bot)
-
-        loop = asyncio.get_event_loop()
-        loop.create_task(application.process_update(update))
-
+        
+        # Run the async update processing
+        asyncio.run(application.process_update(update))
+        
         return jsonify({"ok": True})
-
     except Exception as e:
-        print("Webhook crash:", str(e))
+        print("Webhook error:", e)
         return jsonify({"error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
@@ -602,9 +596,7 @@ def index():
 
 # -------------------- Main Entry --------------------
 async def main():
-    global application, bot_loop
-    
-    bot_loop = asyncio.get_running_loop()
+    global application
     
     # Initialize database
     await init_db_pool()
@@ -625,6 +617,7 @@ async def main():
     # Initialize application
     await application.initialize()
     await application.start()
+    await application.bot.initialize()  # CRITICAL FIX
     logger.info("Application initialized and started")
     
     # Start scheduler
@@ -635,30 +628,31 @@ async def main():
     scheduler.start()
     logger.info("Scheduler started - quizzes every 30 minutes")
     
-    # Set webhook
+    # Set webhook (MANDATORY)
     render_url = os.getenv("RENDER_EXTERNAL_URL")
-    if render_url:
-        webhook_url = f"{render_url}/webhook"
-        result = await application.bot.set_webhook(url=webhook_url)
-        if result:
-            logger.info(f"Webhook set successfully to: {webhook_url}")
-        else:
-            logger.error(f"Failed to set webhook to: {webhook_url}")
-    else:
-        logger.warning("RENDER_EXTERNAL_URL not found, webhook not set")
+    if not render_url:
+        raise Exception("RENDER_EXTERNAL_URL not set")
+    
+    webhook_url = f"{render_url}/webhook"
+    await application.bot.set_webhook(url=webhook_url)
+    print("Webhook set:", webhook_url)
+    logger.info(f"Webhook set to: {webhook_url}")
 
-def start_flask():
-    """Start Flask in a separate thread"""
+def run_flask():
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # Create event loop for async operations
+    # Run async main setup
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
-    # Run main async setup
     loop.run_until_complete(main())
     
-    # Start Flask in the main thread (it blocks)
-    start_flask()
+    # Start Flask in a separate thread (fixes blocking)
+    threading.Thread(target=run_flask).start()
+    
+    # Keep the main thread alive
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")

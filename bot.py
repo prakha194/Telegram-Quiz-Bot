@@ -575,23 +575,26 @@ def create_application():
 # -------------------- Flask Webhook (SYNC - no async) --------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """Synchronous webhook handler - receives updates from Telegram"""
-    global application, bot_loop
-    
+    global application
+
     try:
+        if application is None:
+            print("Application not ready")
+            return jsonify({"error": "app not ready"}), 500
+
         data = request.get_json(force=True)
+        print("Incoming update:", data)
+
         update = Update.de_json(data, application.bot)
-        
-        # Schedule the update processing in the asyncio event loop
-        asyncio.run_coroutine_threadsafe(
-            application.process_update(update),
-            bot_loop
-        )
-        
+
+        loop = asyncio.get_event_loop()
+        loop.create_task(application.process_update(update))
+
         return jsonify({"ok": True})
+
     except Exception as e:
-        logger.error(f"Webhook error: {e}")
-        return jsonify({"ok": False, "error": str(e)}), 500
+        print("Webhook crash:", str(e))
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/", methods=["GET"])
 def index():

@@ -195,9 +195,8 @@ Make it fun and concise."""
                     timeout=30
                 ) as resp:
                     data = await resp.json()
-                    logger.info(f"Gemini raw response: {data}")  # See exactly what's returned
+                    logger.info(f"Gemini raw response: {data}")
 
-                    # Handle blocked/error responses
                     if 'candidates' not in data:
                         reason = data.get('promptFeedback', {}).get('blockReason') or data.get('error', {}).get('message') or str(data)
                         logger.error(f"Gemini no candidates (attempt {attempt+1}): {reason}")
@@ -206,7 +205,6 @@ Make it fun and concise."""
 
                     candidate = data['candidates'][0]
 
-                    # Handle safety-blocked candidates
                     if candidate.get('finishReason') not in ('STOP', None, 'MAX_TOKENS'):
                         logger.error(f"Gemini bad finishReason: {candidate.get('finishReason')}")
                         await asyncio.sleep(2)
@@ -223,7 +221,7 @@ Make it fun and concise."""
                         elif line.startswith("ANSWER:"):
                             ans = line.replace("ANSWER:", "").strip().upper()
                             if ans and ans[0] in 'ABCD':
-                                ans = ans[0]  # Take just the letter in case of "A)" or "A."
+                                ans = ans[0]
 
                     if q and len(opts) == 4 and ans in 'ABCD':
                         return {'question': q, 'options': opts, 'correct_letter': ans, 'correct_index': ord(ans) - 65}
@@ -244,7 +242,6 @@ async def delete_later(bot, chat_id, msg_id, delay=30):
         pass
 
 def format_rank(rank):
-    """Medal for top 3, #N for everyone else."""
     if rank == 1: return "🥇"
     if rank == 2: return "🥈"
     if rank == 3: return "🥉"
@@ -266,7 +263,7 @@ async def send_quiz(chat_id, title, bot):
         options=quiz['options'],
         type=Poll.QUIZ,
         correct_option_id=quiz['correct_index'],
-        is_anonymous=False,  # FIX: must be False so PollAnswerHandler fires
+        is_anonymous=False,
         explanation=f"Correct: {quiz['correct_letter']} - {quiz['options'][quiz['correct_index']]}",
         open_period=900
     )
@@ -277,17 +274,36 @@ async def send_quiz(chat_id, title, bot):
         'quiz_id': qid,
         'correct': quiz['correct_index']
     }
-    asyncio.create_task(delete_later(bot, chat_id, sent.message_id, 310))
+    asyncio.create_task(delete_later(bot, chat_id, sent.message_id, 910))
     logger.info(f"Quiz sent to {chat_id}: {quiz['question']}")
 
-async def send_quizzes_to_all():
-    logger.info("Scheduler: sending quizzes to all groups")
-    groups = await get_active_groups()
-    for g in groups:
-        try:
-            await send_quiz(g['chat_id'], g['chat_title'], application.bot)
-        except Exception as e:
-            logger.error(f"Failed to send quiz to {g['chat_id']}: {e}")
+# FIX: each group gets its own independent scheduler job
+def schedule_group(chat_id, chat_title):
+    job_id = f"quiz_{chat_id}"
+    if scheduler.get_job(job_id):
+        return  # already scheduled
+    scheduler.add_job(
+        send_quiz_for_group,
+        'interval',
+        minutes=15,
+        args=[chat_id, chat_title],
+        id=job_id,
+        max_instances=1,
+        misfire_grace_time=60
+    )
+    logger.info(f"Scheduled independent quiz job for {chat_id} ({chat_title})")
+
+def unschedule_group(chat_id):
+    job_id = f"quiz_{chat_id}"
+    if scheduler.get_job(job_id):
+        scheduler.remove_job(job_id)
+        logger.info(f"Removed quiz job for {chat_id}")
+
+async def send_quiz_for_group(chat_id, chat_title):
+    try:
+        await send_quiz(chat_id, chat_title, application.bot)
+    except Exception as e:
+        logger.error(f"Failed to send quiz to {chat_id}: {e}")
 
 # -------------------- Poll Answer --------------------
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -297,7 +313,6 @@ async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     opt = pa.option_ids
 
     if not opt:
-        # User retracted their answer
         return
 
     for cid, data in list(active_polls.items()):
@@ -329,7 +344,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         msg = await update.message.reply_text(
-            "Hey! I'll send short quizzes every 5 minutes.\nUse /stats and /leaderboard."
+            "Hey! I'll send short quizzes every 15 minutes.\nUse /stats and /leaderboard."
         )
         asyncio.create_task(delete_later(context.bot, update.effective_chat.id, msg.message_id, 30))
 
@@ -362,14 +377,12 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     title = update.effective_chat.title or "This group"
 
-    # This group's global rank only
     group_rank = await get_group_global_rank(cid)
     lines = [f"Leaderboard - {title}"]
     if group_rank:
         lines.append(f"Group global rank: #{group_rank}")
     lines.append("")
 
-    # Top 5 members of this group only
     members = await get_top_members(cid, 5)
     if members:
         lines.append("Top Members")
@@ -420,16 +433,19 @@ async def group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = update.effective_chat.title or "Group"
             await add_group(cid, title)
             msg = await update.message.reply_text(
-                "I'm Albert! I'll send short quizzes every 5 minutes.\nUse /stats and /leaderboard."
+                "I'm Albert! I'll send short quizzes every 15 minutes.\nUse /stats and /leaderboard."
             )
             asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 30))
+            # Send first quiz immediately, then schedule independent repeating job
             await send_quiz(cid, title, context.bot)
+            schedule_group(cid, title)
             break
 
 async def group_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     await remove_group(cid)
     active_polls.pop(cid, None)
+    unschedule_group(cid)  # FIX: remove this group's independent job
 
 # -------------------- Flask Webhook --------------------
 @app.route("/webhook", methods=["POST"])
@@ -461,8 +477,14 @@ async def main():
     await application.initialize()
     await application.start()
     scheduler = AsyncIOScheduler(event_loop=main_loop)
-    scheduler.add_job(send_quizzes_to_all, 'interval', minutes=15)
     scheduler.start()
+
+    # FIX: on startup, restore an independent job for every already-active group
+    groups = await get_active_groups()
+    for g in groups:
+        schedule_group(g['chat_id'], g['chat_title'])
+    logger.info(f"Restored {len(groups)} group scheduler jobs")
+
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:
         await application.bot.set_webhook(url=f"{render_url}/webhook")

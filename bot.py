@@ -265,7 +265,7 @@ async def send_quiz(chat_id, title, bot):
         correct_option_id=quiz['correct_index'],
         is_anonymous=False,
         explanation=f"Correct: {quiz['correct_letter']} - {quiz['options'][quiz['correct_index']]}",
-        open_period=900
+        open_period=1200
     )
     qid = await save_quiz(chat_id, quiz['question'], quiz['correct_letter'], quiz['options'])
     active_polls[chat_id] = {
@@ -285,7 +285,7 @@ def schedule_group(chat_id, chat_title):
     scheduler.add_job(
         send_quiz_for_group,
         'interval',
-        minutes=15,
+        minutes=30,
         args=[chat_id, chat_title],
         id=job_id,
         max_instances=1,
@@ -344,7 +344,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         msg = await update.message.reply_text(
-            "Hey! I'll send short quizzes every 15 minutes.\nUse /stats and /leaderboard."
+            "Hey! I'll send short quizzes every 30 minutes.\nUse /stats and /leaderboard."
         )
         asyncio.create_task(delete_later(context.bot, update.effective_chat.id, msg.message_id, 30))
 
@@ -388,7 +388,7 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Top Members")
         for i, m in enumerate(members, 1):
             name = m['first_name'] or "Anonymous"
-            lines.append(f"#{i} {name} - {m['correct_answers']} correct / {m['wrong_answers']} wrong")
+            lines.append(f"#{i} {name}")  # only rank and name
     else:
         lines.append("No answers yet. Answer a quiz to appear here!")
 
@@ -410,19 +410,19 @@ async def my_stats_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rank = await get_global_rank(user.id)
         rank_display = format_rank(rank)
         text = (
-            f"Your Global Stats\n\n"
-            f"Name: {user.first_name}\n"
-            f"Correct: {correct}\n"
-            f"Wrong: {wrong}\n"
-            f"Attempts: {total}\n"
-            f"Accuracy: {acc}%\n"
-            f"Global Rank: {rank_display}"
+            f"🎯 Your Global Stats\n\n"
+            f"👤 Name: {user.first_name}\n"
+            f"✅ Correct: {correct}\n"
+            f"❌ Wrong: {wrong}\n"
+            f"🎮 Attempts: {total}\n"
+            f"📊 Accuracy: {acc}%\n"
+            f"🏆 Global Rank: {rank_display}"
         )
     else:
         text = (
-            f"Your Global Stats\n\n"
-            f"Name: {user.first_name}\n"
-            f"No quizzes answered yet. Join a group and answer a quiz!"
+            f"🎯 Your Global Stats\n\n"
+            f"👤 Name: {user.first_name}\n"
+            f"No quizzes answered yet. Join a group and answer a quiz! 🚀"
         )
     await context.bot.send_message(chat_id=user.id, text=text)
 
@@ -433,7 +433,7 @@ async def group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
             title = update.effective_chat.title or "Group"
             await add_group(cid, title)
             msg = await update.message.reply_text(
-                "I'm Albert! I'll send short quizzes every 15 minutes.\nUse /stats and /leaderboard."
+                "I'm Albert! I'll send short quizzes every 30 minutes.\nUse /stats and /leaderboard."
             )
             asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 30))
             # Send first quiz immediately, then schedule independent repeating job

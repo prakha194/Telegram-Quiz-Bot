@@ -17,7 +17,6 @@ from telegram.ext import (
 )
 import aiohttp
 import asyncpg
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,10 +28,10 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1
 
 app = Flask(__name__)
 active_polls = {}
+group_tasks = {}  # FIX: track per-group loop tasks
 db_pool = None
 application = None
 main_loop = None
-scheduler = None
 
 # -------------------- Database --------------------
 async def init_db():
@@ -249,6 +248,7 @@ def format_rank(rank):
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz(chat_id, title, bot):
+    # Delete previous poll if exists
     if chat_id in active_polls:
         try:
             await bot.delete_message(chat_id, active_polls[chat_id]['msg_id'])
@@ -265,7 +265,7 @@ async def send_quiz(chat_id, title, bot):
         correct_option_id=quiz['correct_index'],
         is_anonymous=False,
         explanation=f"Correct: {quiz['correct_letter']} - {quiz['options'][quiz['correct_index']]}",
-        open_period=1200
+        open_period=1800
     )
     qid = await save_quiz(chat_id, quiz['question'], quiz['correct_letter'], quiz['options'])
     active_polls[chat_id] = {
@@ -274,36 +274,39 @@ async def send_quiz(chat_id, title, bot):
         'quiz_id': qid,
         'correct': quiz['correct_index']
     }
-    asyncio.create_task(delete_later(bot, chat_id, sent.message_id, 910))
+    # FIX: no delete_later here — the loop handles deletion after 1800s
     logger.info(f"Quiz sent to {chat_id}: {quiz['question']}")
 
-# FIX: each group gets its own independent scheduler job
+# FIX: per-group loop — wait 30 min, delete, immediately send next
+async def quiz_loop(chat_id, chat_title):
+    while True:
+        try:
+            await send_quiz(chat_id, chat_title, application.bot)
+        except Exception as e:
+            logger.error(f"Failed to send quiz to {chat_id}: {e}")
+        # Wait 30 minutes
+        await asyncio.sleep(1800)
+        # Delete the poll immediately after timer ends
+        if chat_id in active_polls:
+            try:
+                await application.bot.delete_message(chat_id, active_polls[chat_id]['msg_id'])
+            except:
+                pass
+            del active_polls[chat_id]
+        # Next iteration starts immediately → sends new quiz right away
+
 def schedule_group(chat_id, chat_title):
-    job_id = f"quiz_{chat_id}"
-    if scheduler.get_job(job_id):
-        return  # already scheduled
-    scheduler.add_job(
-        send_quiz_for_group,
-        'interval',
-        minutes=30,
-        args=[chat_id, chat_title],
-        id=job_id,
-        max_instances=1,
-        misfire_grace_time=60
-    )
-    logger.info(f"Scheduled independent quiz job for {chat_id} ({chat_title})")
+    if chat_id in group_tasks and not group_tasks[chat_id].done():
+        return  # already running
+    task = asyncio.create_task(quiz_loop(chat_id, chat_title))
+    group_tasks[chat_id] = task
+    logger.info(f"Started quiz loop for {chat_id} ({chat_title})")
 
 def unschedule_group(chat_id):
-    job_id = f"quiz_{chat_id}"
-    if scheduler.get_job(job_id):
-        scheduler.remove_job(job_id)
-        logger.info(f"Removed quiz job for {chat_id}")
-
-async def send_quiz_for_group(chat_id, chat_title):
-    try:
-        await send_quiz(chat_id, chat_title, application.bot)
-    except Exception as e:
-        logger.error(f"Failed to send quiz to {chat_id}: {e}")
+    if chat_id in group_tasks:
+        group_tasks[chat_id].cancel()
+        del group_tasks[chat_id]
+        logger.info(f"Stopped quiz loop for {chat_id}")
 
 # -------------------- Poll Answer --------------------
 async def handle_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -388,7 +391,7 @@ async def leaderboard_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Top Members")
         for i, m in enumerate(members, 1):
             name = m['first_name'] or "Anonymous"
-            lines.append(f"#{i} {name}")  # only rank and name
+            lines.append(f"#{i} {name}")
     else:
         lines.append("No answers yet. Answer a quiz to appear here!")
 
@@ -436,16 +439,14 @@ async def group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "I'm Albert! I'll send short quizzes every 30 minutes.\nUse /stats and /leaderboard."
             )
             asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 30))
-            # Send first quiz immediately, then schedule independent repeating job
-            await send_quiz(cid, title, context.bot)
-            schedule_group(cid, title)
+            schedule_group(cid, title)  # loop sends first quiz immediately
             break
 
 async def group_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cid = update.effective_chat.id
     await remove_group(cid)
     active_polls.pop(cid, None)
-    unschedule_group(cid)  # FIX: remove this group's independent job
+    unschedule_group(cid)
 
 # -------------------- Flask Webhook --------------------
 @app.route("/webhook", methods=["POST"])
@@ -463,7 +464,7 @@ def index():
 
 # -------------------- Main --------------------
 async def main():
-    global application, main_loop, scheduler
+    global application, main_loop
     main_loop = asyncio.get_running_loop()
     await init_db()
     application = Application.builder().token(BOT_TOKEN).build()
@@ -476,14 +477,12 @@ async def main():
     application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_leave))
     await application.initialize()
     await application.start()
-    scheduler = AsyncIOScheduler(event_loop=main_loop)
-    scheduler.start()
 
-    # FIX: on startup, restore an independent job for every already-active group
+    # Restore loops for all existing active groups on startup
     groups = await get_active_groups()
     for g in groups:
         schedule_group(g['chat_id'], g['chat_title'])
-    logger.info(f"Restored {len(groups)} group scheduler jobs")
+    logger.info(f"Restored {len(groups)} group quiz loops")
 
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:
@@ -503,6 +502,4 @@ if __name__ == "__main__":
     try:
         loop.run_forever()
     except KeyboardInterrupt:
-        if scheduler:
-            scheduler.shutdown()
         loop.run_until_complete(application.stop())

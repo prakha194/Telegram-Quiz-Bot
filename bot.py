@@ -268,7 +268,7 @@ async def send_quiz(chat_id, title, bot):
         correct_option_id=quiz['correct_index'],
         is_anonymous=False,  # FIX: must be False so PollAnswerHandler fires
         explanation=f"Correct: {quiz['correct_letter']} - {quiz['options'][quiz['correct_index']]}",
-        open_period=300
+        open_period=900
     )
     qid = await save_quiz(chat_id, quiz['question'], quiz['correct_letter'], quiz['options'])
     active_polls[chat_id] = {

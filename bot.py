@@ -461,7 +461,7 @@ async def main():
     await application.initialize()
     await application.start()
     scheduler = AsyncIOScheduler(event_loop=main_loop)
-    scheduler.add_job(send_quizzes_to_all, 'interval', minutes=5)
+    scheduler.add_job(send_quizzes_to_all, 'interval', minutes=15)
     scheduler.start()
     render_url = os.getenv("RENDER_EXTERNAL_URL")
     if render_url:

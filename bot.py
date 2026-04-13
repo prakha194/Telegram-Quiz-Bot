@@ -279,21 +279,57 @@ async def send_quiz(chat_id, title, bot):
 
 # FIX: per-group loop — wait 30 min, delete, immediately send next
 async def quiz_loop(chat_id, chat_title):
+    next_quiz = None  # carries pre-generated quiz into next iteration
     while True:
         try:
-            await send_quiz(chat_id, chat_title, application.bot)
+            if next_quiz:
+                # Send pre-generated quiz instantly (no Gemini wait)
+                sent = await application.bot.send_poll(
+                    chat_id=chat_id,
+                    question=next_quiz['question'],
+                    options=next_quiz['options'],
+                    type=Poll.QUIZ,
+                    correct_option_id=next_quiz['correct_index'],
+                    is_anonymous=False,
+                    explanation=f"Correct: {next_quiz['correct_letter']} - {next_quiz['options'][next_quiz['correct_index']]}",
+                    open_period=1800
+                )
+                qid = await save_quiz(chat_id, next_quiz['question'], next_quiz['correct_letter'], next_quiz['options'])
+                active_polls[chat_id] = {
+                    'msg_id': sent.message_id,
+                    'poll_id': sent.poll.id,
+                    'quiz_id': qid,
+                    'correct': next_quiz['correct_index']
+                }
+                logger.info(f"Sent pre-generated quiz to {chat_id}: {next_quiz['question']}")
+                next_quiz = None
+            else:
+                # First ever quiz for this group
+                await send_quiz(chat_id, chat_title, application.bot)
         except Exception as e:
             logger.error(f"Failed to send quiz to {chat_id}: {e}")
+            await asyncio.sleep(60)
+            continue
+
         # Wait 30 minutes
         await asyncio.sleep(1800)
-        # Delete the poll immediately after timer ends
+
+        # Pre-generate BEFORE deleting so next send is instant
+        try:
+            next_quiz = await generate_quiz()
+            logger.info(f"Pre-generated next quiz for {chat_id}")
+        except Exception as e:
+            logger.error(f"Pre-generation failed for {chat_id}: {e}")
+            next_quiz = None
+
+        # Always delete old poll, regardless of pre-generation success
         if chat_id in active_polls:
             try:
                 await application.bot.delete_message(chat_id, active_polls[chat_id]['msg_id'])
             except:
                 pass
             del active_polls[chat_id]
-        # Next iteration starts immediately → sends new quiz right away
+        # Loop back → sends next_quiz instantly if ready, else generates fresh
 
 def schedule_group(chat_id, chat_title):
     if chat_id in group_tasks and not group_tasks[chat_id].done():

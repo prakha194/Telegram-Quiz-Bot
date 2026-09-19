@@ -22,9 +22,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DATABASE_URL = os.getenv("DATABASE_URL")
-GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite"
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731:free"
 
 app = Flask(__name__)
 active_polls = {}
@@ -173,7 +174,7 @@ async def get_group_global_rank(chat_id):
             return i
     return None
 
-# -------------------- Gemini --------------------
+# -------------------- OpenRouter --------------------
 async def generate_quiz():
     categories = ["Brainstorming", "News", "GK", "Riddle", "Science", "Tech", "World News",
                   "Telegram", "History", "Geography", "Sports"]
@@ -185,31 +186,35 @@ QUESTION: (max 15 words)
 OPTIONS: A) ... | B) ... | C) ... | D) ...
 ANSWER: A, B, C or D
 Make it fun and concise."""
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
     for attempt in range(3):
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
-                    f"{GEMINI_URL}?key={GEMINI_API_KEY}",
-                    json={"contents": [{"parts": [{"text": prompt}]}]},
+                    OPENROUTER_URL,
+                    headers=headers,
+                    json=payload,
                     timeout=30
                 ) as resp:
                     data = await resp.json()
-                    logger.info(f"Gemini raw response: {data}")
+                    logger.info(f"OpenRouter raw response: {data}")
 
-                    if 'candidates' not in data:
-                        reason = data.get('promptFeedback', {}).get('blockReason') or data.get('error', {}).get('message') or str(data)
-                        logger.error(f"Gemini no candidates (attempt {attempt+1}): {reason}")
+                    if 'choices' not in data or not data['choices']:
+                        reason = data.get('error', {}).get('message') or str(data)
+                        logger.error(f"OpenRouter no choices (attempt {attempt+1}): {reason}")
                         await asyncio.sleep(2)
                         continue
 
-                    candidate = data['candidates'][0]
-
-                    if candidate.get('finishReason') not in ('STOP', None, 'MAX_TOKENS'):
-                        logger.error(f"Gemini bad finishReason: {candidate.get('finishReason')}")
-                        await asyncio.sleep(2)
-                        continue
-
-                    text = candidate['content']['parts'][0]['text']
+                    text = data['choices'][0]['message']['content']
                     q, opts, ans = "", [], ""
                     for line in text.split('\n'):
                         line = line.strip()
@@ -225,12 +230,12 @@ Make it fun and concise."""
                     if q and len(opts) == 4 and ans in 'ABCD':
                         return {'question': q, 'options': opts, 'correct_letter': ans, 'correct_index': ord(ans) - 65}
                     else:
-                        logger.error(f"Gemini bad parse — q={q!r} opts={opts} ans={ans!r}\nRaw:\n{text}")
+                        logger.error(f"OpenRouter bad parse — q={q!r} opts={opts} ans={ans!r}\nRaw:\n{text}")
 
         except Exception as e:
-            logger.error(f"Gemini exception (attempt {attempt+1}): {e}")
+            logger.error(f"OpenRouter exception (attempt {attempt+1}): {e}")
         await asyncio.sleep(2)
-    raise Exception("Gemini failed after 3 attempts")
+    raise Exception("OpenRouter failed after 3 attempts")
 
 # -------------------- Helpers --------------------
 async def delete_later(bot, chat_id, msg_id, delay=30):

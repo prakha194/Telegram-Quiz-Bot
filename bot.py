@@ -237,6 +237,61 @@ Make it fun and concise."""
         await asyncio.sleep(2)
     raise Exception("OpenRouter failed after 3 attempts")
 
+# -------------------- Test Command --------------------
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ping OpenRouter to verify API key + model are working."""
+    msg = await update.message.reply_text("🧪 Testing OpenRouter API...")
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+        "max_tokens": 10,
+    }
+
+    start = time.time()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                OPENROUTER_URL, headers=headers, json=payload, timeout=30
+            ) as resp:
+                elapsed = round((time.time() - start) * 1000)
+                status = resp.status
+                data = await resp.json()
+
+        if status != 200 or 'choices' not in data:
+            err = data.get('error', {}).get('message') or str(data)
+            await msg.edit_text(
+                f"❌ OpenRouter FAILED\n\n"
+                f"Status: {status}\n"
+                f"Model: `{OPENROUTER_MODEL}`\n"
+                f"Time: {elapsed}ms\n"
+                f"Error: {err}"
+            )
+            return
+
+        reply = data['choices'][0]['message']['content'].strip()
+        usage = data.get('usage', {})
+        await msg.edit_text(
+            f"✅ OpenRouter OK\n\n"
+            f"Model: `{OPENROUTER_MODEL}`\n"
+            f"Status: {status}\n"
+            f"Latency: {elapsed}ms\n"
+            f"Reply: {reply}\n"
+            f"Tokens: {usage.get('total_tokens', '?')}"
+        )
+    except Exception as e:
+        elapsed = round((time.time() - start) * 1000)
+        await msg.edit_text(
+            f"❌ OpenRouter EXCEPTION\n\n"
+            f"Model: `{OPENROUTER_MODEL}`\n"
+            f"Time: {elapsed}ms\n"
+            f"Error: {e}"
+        )
+
 # -------------------- Helpers --------------------
 async def delete_later(bot, chat_id, msg_id, delay=30):
     await asyncio.sleep(delay)
@@ -288,7 +343,7 @@ async def quiz_loop(chat_id, chat_title):
     while True:
         try:
             if next_quiz:
-                # Send pre-generated quiz instantly (no Gemini wait)
+                # Send pre-generated quiz instantly (no OpenRouter wait)
                 sent = await application.bot.send_poll(
                     chat_id=chat_id,
                     question=next_quiz['question'],
@@ -510,6 +565,7 @@ async def main():
     await init_db()
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("test", test_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
     application.add_handler(CallbackQueryHandler(my_stats_callback, pattern="my_stats"))

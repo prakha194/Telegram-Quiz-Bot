@@ -29,7 +29,7 @@ OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731:free"
 
 app = Flask(__name__)
 active_polls = {}
-group_tasks = {}  # FIX: track per-group loop tasks
+group_tasks = {}
 db_pool = None
 application = None
 main_loop = None
@@ -292,6 +292,155 @@ async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Error: {e}"
         )
 
+# -------------------- Groups Commands --------------------
+async def groups_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List every group in DB with copyable IDs + tap buttons."""
+    groups = await db_pool.fetch(
+        "SELECT chat_id, chat_title, is_active FROM groups ORDER BY is_active DESC, added_date DESC"
+    )
+    if not groups:
+        await update.message.reply_text("No groups in database yet.")
+        return
+
+    lines = ["📋 <b>Groups in database</b>\n"]
+    keyboard = []
+    for g in groups:
+        status = "✅" if g['is_active'] else "❌"
+        title = g['chat_title'] or "Untitled"
+        lines.append(f"{status} <code>{g['chat_id']}</code> — {title}")
+        keyboard.append([InlineKeyboardButton(
+            f"{status} {title[:45]}", callback_data=f"ginfo:{g['chat_id']}"
+        )])
+
+    lines.append("\nTap a group below or use <code>/groupinfo &lt;id or name&gt;</code>")
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+async def groupinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Look up a specific group by ID or partial name."""
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: <code>/groupinfo &lt;chat_id or name&gt;</code>",
+            parse_mode="HTML"
+        )
+        return
+    await _show_group_info(update.effective_message, context.bot, " ".join(context.args), edit=False)
+
+async def groupinfo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cid = query.data.split(":", 1)[1]
+    await _show_group_info(query.message, context.bot, cid, edit=True)
+
+async def _show_group_info(message, bot, query, edit=False):
+    """Fetch group details from DB + Telegram, show permissions."""
+    row = None
+    try:
+        cid = int(query)
+        row = await db_pool.fetchrow("SELECT * FROM groups WHERE chat_id=$1", cid)
+    except ValueError:
+        row = await db_pool.fetchrow(
+            "SELECT * FROM groups WHERE chat_title ILIKE $1 ORDER BY added_date DESC LIMIT 1",
+            f"%{query}%"
+        )
+
+    if not row:
+        text = f"❌ No group found matching: <code>{query}</code>"
+        if edit:
+            await message.edit_text(text, parse_mode="HTML")
+        else:
+            await message.reply_text(text, parse_mode="HTML")
+        return
+
+    cid = row['chat_id']
+    added = row['added_date'].strftime('%Y-%m-%d %H:%M') if row['added_date'] else '?'
+
+    lines = [f"📌 <b>{row['chat_title'] or 'Untitled'}</b>"]
+    lines.append(f"ID: <code>{cid}</code>")
+    lines.append(f"Active: {'✅' if row['is_active'] else '❌'}")
+    lines.append(f"Added: {added}")
+
+    # Live Telegram info
+    try:
+        chat = await bot.get_chat(cid)
+        lines.append(f"\nType: {chat.type}")
+        if chat.username:
+            lines.append(f"Username: @{chat.username}")
+        try:
+            count = await bot.get_chat_member_count(cid)
+            lines.append(f"Members: {count}")
+        except Exception:
+            pass
+    except Exception as e:
+        lines.append(f"\n⚠️ Cannot reach chat: <code>{e}</code>")
+        text = "\n".join(lines)
+        if edit:
+            await message.edit_text(text, parse_mode="HTML")
+        else:
+            await message.reply_text(text, parse_mode="HTML")
+        return
+
+    # Bot status + permissions
+    try:
+        me = await bot.get_chat_member(cid, bot.id)
+        lines.append(f"\n🤖 <b>Bot status:</b> {me.status}")
+
+        if me.status == 'administrator':
+            access = "✅ Full access (admin — receives all messages)"
+        elif me.status == 'member':
+            access = "⚠️ Limited (privacy mode — only commands/mentions/replies)"
+        elif me.status == 'restricted':
+            access = "⚠️ Restricted member"
+        elif me.status == 'left':
+            access = "❌ Bot is not in this chat (left or kicked)"
+        elif me.status == 'kicked':
+            access = "❌ Bot is banned from this chat"
+        else:
+            access = f"❓ {me.status}"
+        lines.append(f"Message access: {access}")
+
+        perm_labels = {
+            'can_manage_chat': 'Manage chat',
+            'can_delete_messages': 'Delete messages',
+            'can_manage_video_chats': 'Manage video chats',
+            'can_restrict_members': 'Restrict members',
+            'can_promote_members': 'Promote members',
+            'can_change_info': 'Change info',
+            'can_invite_users': 'Invite users',
+            'can_pin_messages': 'Pin messages',
+            'can_post_messages': 'Post messages',
+            'can_edit_messages': 'Edit messages',
+            'can_send_polls': 'Send polls',
+            'can_send_messages': 'Send messages',
+            'can_send_other_messages': 'Send other messages',
+            'can_send_audios': 'Send audios',
+            'can_send_documents': 'Send documents',
+            'can_send_photos': 'Send photos',
+            'can_send_videos': 'Send videos',
+            'can_send_voice_notes': 'Send voice notes',
+            'can_add_web_page_previews': 'Add web previews',
+        }
+        perms = []
+        for attr, label in perm_labels.items():
+            if hasattr(me, attr):
+                val = getattr(me, attr)
+                if val is not None:
+                    perms.append(f"{'✅' if val else '❌'} {label}")
+        if perms:
+            lines.append("\n🔑 <b>Permissions:</b>")
+            lines.extend(perms)
+    except Exception as e:
+        lines.append(f"\n⚠️ Cannot check permissions: <code>{e}</code>")
+
+    text = "\n".join(lines)
+    if edit:
+        await message.edit_text(text, parse_mode="HTML")
+    else:
+        await message.reply_text(text, parse_mode="HTML")
+
 # -------------------- Helpers --------------------
 async def delete_later(bot, chat_id, msg_id, delay=30):
     await asyncio.sleep(delay)
@@ -308,7 +457,6 @@ def format_rank(rank):
 
 # -------------------- Quiz Sender --------------------
 async def send_quiz(chat_id, title, bot):
-    # Delete previous poll if exists
     if chat_id in active_polls:
         try:
             await bot.delete_message(chat_id, active_polls[chat_id]['msg_id'])
@@ -334,16 +482,13 @@ async def send_quiz(chat_id, title, bot):
         'quiz_id': qid,
         'correct': quiz['correct_index']
     }
-    # FIX: no delete_later here — the loop handles deletion after 1800s
     logger.info(f"Quiz sent to {chat_id}: {quiz['question']}")
 
-# FIX: per-group loop — wait 30 min, delete, immediately send next
 async def quiz_loop(chat_id, chat_title):
-    next_quiz = None  # carries pre-generated quiz into next iteration
+    next_quiz = None
     while True:
         try:
             if next_quiz:
-                # Send pre-generated quiz instantly (no OpenRouter wait)
                 sent = await application.bot.send_poll(
                     chat_id=chat_id,
                     question=next_quiz['question'],
@@ -364,17 +509,14 @@ async def quiz_loop(chat_id, chat_title):
                 logger.info(f"Sent pre-generated quiz to {chat_id}: {next_quiz['question']}")
                 next_quiz = None
             else:
-                # First ever quiz for this group
                 await send_quiz(chat_id, chat_title, application.bot)
         except Exception as e:
             logger.error(f"Failed to send quiz to {chat_id}: {e}")
             await asyncio.sleep(60)
             continue
 
-        # Wait 30 minutes
         await asyncio.sleep(1800)
 
-        # Pre-generate BEFORE deleting so next send is instant
         try:
             next_quiz = await generate_quiz()
             logger.info(f"Pre-generated next quiz for {chat_id}")
@@ -382,18 +524,16 @@ async def quiz_loop(chat_id, chat_title):
             logger.error(f"Pre-generation failed for {chat_id}: {e}")
             next_quiz = None
 
-        # Always delete old poll, regardless of pre-generation success
         if chat_id in active_polls:
             try:
                 await application.bot.delete_message(chat_id, active_polls[chat_id]['msg_id'])
             except:
                 pass
             del active_polls[chat_id]
-        # Loop back → sends next_quiz instantly if ready, else generates fresh
 
 def schedule_group(chat_id, chat_title):
     if chat_id in group_tasks and not group_tasks[chat_id].done():
-        return  # already running
+        return
     task = asyncio.create_task(quiz_loop(chat_id, chat_title))
     group_tasks[chat_id] = task
     logger.info(f"Started quiz loop for {chat_id} ({chat_title})")
@@ -535,7 +675,7 @@ async def group_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "I'm Albert! I'll send short quizzes every 30 minutes.\nUse /stats and /leaderboard."
             )
             asyncio.create_task(delete_later(context.bot, cid, msg.message_id, 30))
-            schedule_group(cid, title)  # loop sends first quiz immediately
+            schedule_group(cid, title)
             break
 
 async def group_leave(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -566,16 +706,18 @@ async def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("test", test_cmd))
+    application.add_handler(CommandHandler("groups", groups_cmd))
+    application.add_handler(CommandHandler("groupinfo", groupinfo_cmd))
     application.add_handler(CommandHandler("stats", stats_cmd))
     application.add_handler(CommandHandler("leaderboard", leaderboard_cmd))
-    application.add_handler(CallbackQueryHandler(my_stats_callback, pattern="my_stats"))
+    application.add_handler(CallbackQueryHandler(my_stats_callback, pattern="^my_stats$"))
+    application.add_handler(CallbackQueryHandler(groupinfo_callback, pattern="^ginfo:"))
     application.add_handler(PollAnswerHandler(handle_poll_answer))
     application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, group_add))
     application.add_handler(MessageHandler(filters.StatusUpdate.LEFT_CHAT_MEMBER, group_leave))
     await application.initialize()
     await application.start()
 
-    # Restore loops for all existing active groups on startup
     groups = await get_active_groups()
     for g in groups:
         schedule_group(g['chat_id'], g['chat_title'])
